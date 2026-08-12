@@ -135,10 +135,40 @@ struct Probe: Decodable {
         let avgFrameRate: String?
         let rFrameRate: String?
         let sideDataList: [SideData]?
+        let tags: [String: String]?
 
         /// The Dolby Vision record on this stream, if it carries one.
         var dolbyVision: SideData? {
             sideDataList?.first { $0.dvProfile != nil }
+        }
+
+        /// What this track alone is spending, in bits per second, or `nil` if it won't say.
+        ///
+        /// Matroska doesn't fill in `bit_rate` per stream — it comes back `N/A` — and the
+        /// obvious fallback, the rate ffprobe reports for the whole file, is not this
+        /// track: on a Blu-ray rip it also counts lossless audio and a dozen subtitle
+        /// tracks, which read as 79.8 Mbps where the picture was spending 66.5. Judging a
+        /// picture by that overstates it by whatever the soundtrack costs, and a file whose
+        /// video is comfortably within budget can be re-encoded because its audio pushed
+        /// the total over.
+        ///
+        /// Matroska does write the real figure per track, as `BPS` or as a byte count to
+        /// divide by the duration, so those are asked first. When nothing says, the answer
+        /// is nil rather than the file's rate: not knowing is not the same as being fat,
+        /// and guessing in that direction costs a generation of quality.
+        func bitsPerSecond(durationInSeconds duration: Double) -> Int? {
+            if let bitRate, let value = Int(bitRate), value > 0 { return value }
+            if let value = tag(named: "BPS").flatMap(Int.init), value > 0 { return value }
+            if duration > 0, let bytes = tag(named: "NUMBER_OF_BYTES").flatMap(Double.init), bytes > 0 {
+                return Int(bytes * 8 / duration)
+            }
+            return nil
+        }
+
+        /// A Matroska tag, matched by name and ignoring the language suffix a muxer may
+        /// append — the same tag arrives as `BPS` on one file and `BPS-eng` on the next.
+        private func tag(named name: String) -> String? {
+            tags?.first { $0.key.uppercased().hasPrefix(name) }?.value
         }
 
         /// The frame rate exactly as ffprobe reports it, kept as the rational it is.
@@ -188,6 +218,18 @@ struct Probe: Decodable {
 
     var durationInSeconds: Double {
         Double(format.duration ?? "") ?? 0
+    }
+
+    /// How many bits the picture spends on each pixel of each frame, or `nil` if the file
+    /// won't say what the picture costs.
+    var bitsPerPixel: Double? {
+        guard let picture,
+              let bitrate = picture.bitsPerSecond(durationInSeconds: durationInSeconds),
+              let width = picture.width, let height = picture.height,
+              width > 0, height > 0 else { return nil }
+        let pixelsPerSecond = Double(width * height) * picture.framesPerSecond
+        guard pixelsPerSecond > 0 else { return nil }
+        return Double(bitrate) / pixelsPerSecond
     }
 
     var videoStreams: [Stream] { streams.filter { $0.codecType == "video" } }
@@ -605,13 +647,13 @@ extension Plan {
             frameRate: frameRate,
             dynamicRange: range,
             sourceCodec: picture.codecName ?? "",
-            sourceBitrate: Int(picture.bitRate ?? "") ?? Int(probe.format.bitRate ?? "") ?? 0
+            sourceBitrate: picture.bitsPerSecond(durationInSeconds: probe.durationInSeconds) ?? 0
         )
 
         var arguments = [
             "-c:v", "hevc_videotoolbox",
-            "-tag:v", "hvc1",
-            "-b:v", "\(bitrate)",
+            "-tag:v", "hvc1"
+        ] + PlaybackTarget.rateControlArguments(bitrate: bitrate) + [
             // Two seconds between key frames, which is what Apple's authoring
             // specification asks for and what makes scrubbing land where you dropped it.
             "-g", "\(max(Int((frameRate * PlaybackTarget.keyFrameIntervalInSeconds).rounded()), 1))"
@@ -721,8 +763,10 @@ struct DolbyVisionPlan {
             "-y", "-loglevel", "error",
             "-i", source.path(percentEncoded: false),
             "-map", "0:\(videoStream)", "-an", "-sn",
-            "-c:v", "hevc_videotoolbox",
-            "-b:v", "\(bitrate)",
+            "-c:v", "hevc_videotoolbox"
+        ]
+        + PlaybackTarget.rateControlArguments(bitrate: bitrate)
+        + [
             "-g", "\(max(Int((framesPerSecond * PlaybackTarget.keyFrameIntervalInSeconds).rounded()), 1))",
             "-profile:v", "main10",
             "-pix_fmt", "p010le",
@@ -889,8 +933,10 @@ enum PlaybackTarget {
     /// than a third again over what the picture needs. Below that the storage saved doesn't
     /// pay for the generation of quality it costs.
     static func worthwhileBitrate(for picture: Probe.Stream, probe: Probe) -> Int? {
-        let sourceBitrate = Int(picture.bitRate ?? "") ?? Int(probe.format.bitRate ?? "") ?? 0
-        guard sourceBitrate > 0 else { return nil }
+        // Nothing to judge against means nothing to judge: a file that won't say what its
+        // picture costs is left alone rather than re-encoded on a guess.
+        guard let sourceBitrate = picture.bitsPerSecond(durationInSeconds: probe.durationInSeconds),
+              sourceBitrate > 0 else { return nil }
 
         let range = DynamicRange(transfer: picture.colorTransfer)
         let frameRate = picture.framesPerSecond
@@ -915,6 +961,30 @@ enum PlaybackTarget {
 
     /// How far above the target a source has to sit before re-encoding is worth it.
     static let bitrateTolerance = 1.35
+
+    /// Above this many bits per pixel, a file reads as a master rather than a bad encode.
+    ///
+    /// Apple's own rungs land between roughly 0.15 and 0.20 — 30 Mbps across a 4K frame at
+    /// 24 fps is 0.15. A UHD disc sits around 0.3, because a disc isn't rationing anything.
+    /// The threshold sits between the two: above it the bits are buying picture, below it
+    /// they're being wasted, and the same 60 Mbps means opposite things at 4K and at 1080p.
+    static let masteredBitsPerPixel = 0.25
+
+    /// How to ask VideoToolbox for a rate and actually be given it.
+    ///
+    /// `-b:v` alone is a target its rate controller is free to miss, and it misses by a
+    /// lot: asked for 30 Mbps on a 4K HDR source it delivered 22.1, a quarter of the
+    /// budget left unspent and the file quietly more compressed than the ladder intends.
+    /// `-maxrate`/`-bufsize` are worse than useless here — the same clip came out at 10.0.
+    /// Only `constant_bit_rate` lands on the number, and it lands exactly.
+    ///
+    /// The cost is that a constant rate spends as much on a still frame as on a crowd,
+    /// where a variable one would move those bits to where they're visible. That's a real
+    /// loss of efficiency, and it's still the better trade: the alternative isn't smarter
+    /// distribution, it's the same distribution with a quarter fewer bits in it.
+    static func rateControlArguments(bitrate: Int) -> [String] {
+        ["-b:v", "\(bitrate)", "-constant_bit_rate", "true"]
+    }
 
     /// The rate to encode at: never above Apple's rung for the frame, never above what the
     /// source was already spending, adjusted for how the two codecs compare.
@@ -1021,6 +1091,18 @@ final class ConversionQueue {
         /// isn't tried again on every pass.
         var stillWasRead = false
 
+        /// The Dolby Vision profile this file carries, once it's been read.
+        var dolbyVisionProfile: Int?
+
+        /// How many bits the picture spends per pixel of each frame.
+        ///
+        /// The measure that tells a disc master from a botched encode, which the bit rate
+        /// alone cannot: a 4K remux at 66 Mbps and a mangled 1080p at 60 Mbps are the same
+        /// number and nothing alike. Per pixel they're 0.33 and 1.21, and Apple's own rungs
+        /// sit around 0.15 to 0.20 — so the first is spending its bits and the second is
+        /// wasting them.
+        var bitsPerPixel: Double?
+
         var isConverting: Bool {
             if case .converting = status { true } else { false }
         }
@@ -1066,6 +1148,43 @@ final class ConversionQueue {
 
     var isBusy: Bool { isRunning }
 
+    /// Whether anything still to convert carries Dolby Vision this app could rebuild.
+    ///
+    /// What decides the toggle is in the window, not what's installed on the machine: the
+    /// tools being present says the feature could work, not that it would do anything to
+    /// these files.
+    var hasDolbyVisionWaiting: Bool {
+        Tools.canConvertDolbyVision && jobs.contains { job in
+            job.status == .waiting
+                && job.dolbyVisionProfile.map { DolbyVisionPlan.mode(forProfile: $0) != nil } == true
+        }
+    }
+
+    /// What re-encoding would do to the files waiting, in a sentence.
+    ///
+    /// The toggle used to explain the feature. It's more use explaining the decision: the
+    /// same switch is obviously right on a wasteful encode and a real loss on a disc
+    /// master, and the file itself says which it is.
+    var dolbyVisionAdvice: String {
+        let waiting = jobs.filter { $0.status == .waiting && $0.dolbyVisionProfile != nil }
+        let densities = waiting.compactMap(\.bitsPerPixel)
+        let base = """
+            Bring the picture down to the bit rate Immersive Cinema targets, keeping the \
+            Dolby Vision — which its own optimizer can't, because re-encoding there loses \
+            the metadata.
+            """
+
+        guard let densest = densities.max() else { return base }
+        return densest >= PlaybackTarget.masteredBitsPerPixel
+            ? base + "\n\nThis looks like a disc master, at "
+                + String(format: "%.2f", densest)
+                + " bits per pixel. Those bits are doing work: re-encoding trades picture "
+                + "quality for space rather than removing waste."
+            : base + "\n\nThis encode is spending "
+                + String(format: "%.2f", densest)
+                + " bits per pixel, well above what the picture needs. There's little to lose."
+    }
+
     func add(_ urls: [URL]) {
         let accepted = urls.filter(\.looksLikeVideo)
         guard !accepted.isEmpty else { return }
@@ -1097,7 +1216,11 @@ final class ConversionQueue {
                 )
                 update(id) { job in
                     job.stillWasRead = true
-                    if let probe { job.details = probe.mediaSummary }
+                    if let probe {
+                        job.details = probe.mediaSummary
+                        job.dolbyVisionProfile = probe.picture?.dolbyVision?.dvProfile
+                        job.bitsPerPixel = probe.bitsPerPixel
+                    }
                     if let still {
                         job.image = NSImage(
                             cgImage: still,
@@ -1652,7 +1775,11 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.15), value: isTargeted)
         .toolbar {
             ToolbarItemGroup {
-                if Tools.canConvertDolbyVision {
+                // Only once something in the list is actually Dolby Vision. Offering it on
+                // the strength of the tools being installed put a control in the window
+                // that did nothing at all for a queue of ordinary files — pressed once,
+                // nothing changed, and it taught you not to trust the toolbar.
+                if queue.hasDolbyVisionWaiting {
                     @Bindable var queue = queue
                     Toggle(isOn: $queue.optimizesBitrate) {
                         Label("Optimize Dolby Vision", systemImage: "wand.and.sparkles")
@@ -1661,11 +1788,7 @@ struct ContentView: View {
                     // The only control here that says what it does. A wand on its own gives
                     // no hint which of the two things it is, and one of them costs an hour.
                     .labelStyle(.titleAndIcon)
-                    .help("""
-                        Bring a Dolby Vision picture down to the bit rate Immersive Cinema \
-                        targets, keeping the Dolby Vision. Its own optimizer can't: \
-                        re-encoding there loses the Dolby Vision metadata.
-                        """)
+                    .help(queue.dolbyVisionAdvice)
                     .disabled(queue.isBusy)
                 }
                 if queue.isBusy {
