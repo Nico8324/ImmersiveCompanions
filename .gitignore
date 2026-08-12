@@ -1,0 +1,8 @@
+.DS_Store
+build/
+*.app
+
+# Xcode
+xcuserdata/
+*.xcuserdatad
+DerivedData/

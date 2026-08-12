@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The generated keys are merged into this file at build time; only what Xcode
+	     can't express as a build setting lives here. -->
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.video</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Video</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<!-- Alternate, not Default: this app converts files, it doesn't play them,
+			     so it shouldn't take the double-click away from whatever does. -->
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.movie</string>
+				<string>public.video</string>
+			</array>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>mkv</string><string>webm</string><string>avi</string>
+				<string>flv</string><string>wmv</string><string>vob</string>
+				<string>ogv</string><string>ogm</string><string>ts</string>
+				<string>m2ts</string><string>mts</string><string>mpg</string>
+				<string>mpeg</string><string>divx</string><string>rmvb</string>
+				<string>asf</string><string>3gp</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
