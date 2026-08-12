@@ -1207,7 +1207,7 @@ final class ConversionQueue {
         probe: Probe,
         from source: URL,
         to destination: URL,
-        onProgress: @escaping (Double) -> Void
+        onProgress: @escaping @MainActor (Double) -> Void
     ) async throws {
         guard let ffmpeg = Tools.ffmpeg,
               let doviTool = Tools.doviTool,
@@ -1348,7 +1348,11 @@ final class ConversionQueue {
                 job.status = .converting(fraction: 0)
             }
 
-            let report: (Double) -> Void = { fraction in
+            // Typed as main-actor isolated rather than plain, which is what makes it
+            // `Sendable` enough to hand to the process runners: they call it from a pipe's
+            // readability handler and from a detached task watching a file grow, both off
+            // the main actor, and both hop back here before it runs.
+            let report: @MainActor (Double) -> Void = { fraction in
                 self.update(id) { job in
                     if case .converting = job.status {
                         job.status = .converting(fraction: fraction)
@@ -1431,10 +1435,10 @@ extension Process {
         arguments firstArguments: [String],
         into second: URL,
         arguments secondArguments: [String],
-        holding: @escaping (Process) -> Void,
+        holding: @escaping @MainActor (Process) -> Void,
         expectedBytes: Int64?,
         watching output: URL,
-        onProgress: @escaping (Double) -> Void
+        onProgress: @escaping @MainActor (Double) -> Void
     ) async throws {
         let upstream = Process()
         upstream.executableURL = first
@@ -1477,10 +1481,10 @@ extension Process {
     static func runWatchingOutput(
         _ tool: URL,
         arguments: [String],
-        holding: @escaping (Process) -> Void,
+        holding: @escaping @MainActor (Process) -> Void,
         expectedBytes: Int64?,
         watching output: URL,
-        onProgress: @escaping (Double) -> Void
+        onProgress: @escaping @MainActor (Double) -> Void
     ) async throws {
         let process = Process()
         process.executableURL = tool
@@ -1508,7 +1512,7 @@ extension Process {
     private static func sizeMonitor(
         of url: URL,
         expecting expected: Int64?,
-        onProgress: @escaping (Double) -> Void
+        onProgress: @escaping @MainActor (Double) -> Void
     ) -> Task<Void, Never>? {
         guard let expected, expected > 0 else { return nil }
         return Task.detached(priority: .utility) {
@@ -1537,8 +1541,8 @@ extension Process {
         _ tool: URL,
         arguments: [String],
         duration: Double,
-        holding: @escaping (Process) -> Void,
-        onProgress: @escaping (Double) -> Void
+        holding: @escaping @MainActor (Process) -> Void,
+        onProgress: @escaping @MainActor (Double) -> Void
     ) async throws {
         let process = Process()
         process.executableURL = tool

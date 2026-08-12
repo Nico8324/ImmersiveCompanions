@@ -52,7 +52,15 @@ brew install ffmpeg dovi_tool gpac
 
 ## Architecture
 
-One Swift file, divided by `// MARK:` sections. SwiftUI, `@Observable`, Swift 6.
+One Swift file, divided by `// MARK:` sections. SwiftUI, `@Observable`, **Swift 6 language
+mode** — `SWIFT_VERSION = 6.0`, so strict concurrency is on and the compiler enforces it.
+
+The thing that model turns on here: every progress callback is typed
+`@escaping @MainActor (Double) -> Void`, and `holding` likewise. They're called from a
+pipe's readability handler and from a detached task watching a file grow — both off the main
+actor — and a plain closure isn't `Sendable` enough to cross that boundary. Global-actor
+isolation is what makes them safe to hand over, and it's why `report` in `runNext` is
+declared with an explicit type rather than inferred.
 
 The pipeline for one file: `Probe.read` (ffprobe → JSON) → `Plan.init` (decides copy vs
 re-encode, builds ffmpeg arguments) → either the plain ffmpeg run or `runDolbyVision`'s
