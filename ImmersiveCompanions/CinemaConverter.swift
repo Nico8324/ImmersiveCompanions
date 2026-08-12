@@ -899,7 +899,9 @@ enum DynamicRange {
 ///
 /// One target rather than one per device: Apple Vision Pro, Apple TV 4K and Apple silicon
 /// Macs all decode HEVC Main 10 up to 4K in hardware, so a single file satisfies all three.
-/// The bit rates come from Apple's *HLS Authoring Specification for Apple Devices*.
+/// The bit rates are the top HEVC rung of each tier in Apple's *HLS Authoring
+/// Specification for Apple Devices*, as written, with the specification's own 20%
+/// reduction for 24 fps content applied on top.
 ///
 /// Kept deliberately as a copy rather than shared: this app is a separate tool that must
 /// keep working when the library isn't around. If the library's ladder changes, this needs
@@ -915,11 +917,11 @@ enum PlaybackTarget {
     private static func megabitsPerSecond(pixels: Int, dynamicRange: DynamicRange) -> Double {
         let isHDR = dynamicRange.isHighDynamicRange
         return switch pixels {
-        case ..<460_800: isHDR ? 4 : 3
-        case ..<1_382_400: isHDR ? 8 : 6
-        case ..<2_764_800: isHDR ? 12 : 10
-        case ..<5_529_600: isHDR ? 20 : 16
-        default: isHDR ? 30 : 25
+        case ..<460_800: isHDR ? 1.93 : 1.6
+        case ..<1_382_400: isHDR ? 4.08 : 3.4
+        case ..<2_764_800: isHDR ? 7.0 : 5.8
+        case ..<5_529_600: isHDR ? 9.7 : 8.1
+        default: isHDR ? 20.0 : 16.8
         }
     }
 
@@ -953,7 +955,7 @@ enum PlaybackTarget {
 
         let range = DynamicRange(transfer: picture.colorTransfer)
         let frameRate = picture.framesPerSecond
-        let frameRateFactor = frameRate > 33 ? 1.5 : 1.0
+        let frameRateFactor = frameRate < PlaybackTarget.filmFrameRateCeiling ? 0.8 : 1.0
         let reference = Int(
             megabitsPerSecond(
                 pixels: (picture.width ?? 1920) * (picture.height ?? 1080),
@@ -974,6 +976,14 @@ enum PlaybackTarget {
 
     /// How far above the target a source has to sit before re-encoding is worth it.
     static let bitrateTolerance = 1.35
+
+    /// The frame rate below which the specification's 24 fps reduction applies.
+    ///
+    /// Catches 23.976 and 24 and leaves 25 alone: 24 fps is what the specification names,
+    /// and inventing a rule for PAL film is how the previous numbers went wrong. There is
+    /// deliberately no uplift above 30 either — the tables give one figure per rung for a
+    /// source's own frame rate and say nothing about spending more at 60.
+    static let filmFrameRateCeiling = 24.5
 
     /// Above this many bits per pixel, a file reads as a master rather than a bad encode.
     ///
@@ -1015,7 +1025,7 @@ enum PlaybackTarget {
     ) -> Int {
         // Twice the frames need more than the same bit rate, though not twice as much:
         // consecutive frames at 60 fps are more alike than at 24.
-        let frameRateFactor = frameRate > 33 ? 1.5 : 1.0
+        let frameRateFactor = frameRate < PlaybackTarget.filmFrameRateCeiling ? 0.8 : 1.0
         let reference = Int(
             megabitsPerSecond(pixels: width * height, dynamicRange: dynamicRange)
                 * frameRateFactor * 1_000_000
