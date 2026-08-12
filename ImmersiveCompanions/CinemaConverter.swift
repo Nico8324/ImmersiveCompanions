@@ -557,7 +557,15 @@ extension Plan {
             + ["-progress", "pipe:1", "-nostats", destination.path(percentEncoded: false)]
     }
 
-    init(for probe: Probe, from source: URL, to destination: URL) throws {
+    /// - Parameter isRebuildingDolbyVision: Whether the Dolby Vision route is handling the
+    ///   picture, in which case this plan describes only the audio and subtitles and must
+    ///   not also report what would have happened to the Dolby Vision without it.
+    init(
+        for probe: Probe,
+        from source: URL,
+        to destination: URL,
+        isRebuildingDolbyVision: Bool = false
+    ) throws {
         guard let picture = probe.picture, let codec = picture.codecName else {
             throw ConversionError.noVideo
         }
@@ -600,7 +608,12 @@ extension Plan {
         // correct, which covers the Blu-ray rips this app exists for. A profile 5 base is
         // graded in IPT and is *not* watchable as HDR10 — that one has to be said plainly,
         // because the file will otherwise look wrong rather than fail.
-        if let dolbyVision = picture.dolbyVision, let profile = dolbyVision.dvProfile {
+        //
+        // None of it applies when the RPU is being rebuilt instead: the Dolby Vision is
+        // being kept, not fallen back from, and saying both — "→ profile 8.1" alongside
+        // "→ HDR10 base layer" — described two opposite outcomes for the same file.
+        if !isRebuildingDolbyVision,
+           let dolbyVision = picture.dolbyVision, let profile = dolbyVision.dvProfile {
             let compatibility = dolbyVision.dvBlSignalCompatibilityId ?? 0
             switch profile {
             case 5:
@@ -1118,8 +1131,7 @@ final class ConversionQueue {
         /// The source's size, read up front so a waiting row can show it.
         init(source: URL) {
             self.source = source
-            self.sourceBytes = (try? source.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-                .map(Int64.init)
+            self.sourceBytes = source.currentFileSize
         }
     }
 
@@ -1140,7 +1152,15 @@ final class ConversionQueue {
     /// a generation of quality and a good deal of time, and it should be asked for. It only
     /// applies to Dolby Vision, because that's the only case Immersive Cinema can't handle
     /// for itself — for anything else its own optimizer does this properly, after import.
-    var optimizesBitrate = false
+    ///
+    /// Kept between launches. Whether someone wants their library prepared this way is a
+    /// standing preference, not something to answer again every time the app opens — and a
+    /// switch that forgets is a switch you stop trusting.
+    var optimizesBitrate = UserDefaults.standard.bool(forKey: ConversionQueue.optimizeKey) {
+        didSet { UserDefaults.standard.set(optimizesBitrate, forKey: Self.optimizeKey) }
+    }
+
+    static let optimizeKey = "optimizesDolbyVision"
 
     private var isRunning = false
     private var current: Process?
@@ -1148,15 +1168,21 @@ final class ConversionQueue {
 
     var isBusy: Bool { isRunning }
 
-    /// Whether anything still to convert carries Dolby Vision this app could rebuild.
+    /// Whether anything in the list carries Dolby Vision this app could rebuild.
     ///
     /// What decides the toggle is in the window, not what's installed on the machine: the
     /// tools being present says the feature could work, not that it would do anything to
     /// these files.
-    var hasDolbyVisionWaiting: Bool {
+    ///
+    /// Any job counts, not only the ones still waiting. A single dropped file goes straight
+    /// to converting and the probe that discovers its profile finishes later still, so
+    /// keying on `waiting` left a control that was correctly scoped and never actually
+    /// there. The setting itself is remembered between launches, which is what makes it
+    /// useful before a drop rather than during one; here it stays visible so you can see
+    /// what it's set to, and change it for what comes next or for a retry.
+    var hasDolbyVision: Bool {
         Tools.canConvertDolbyVision && jobs.contains { job in
-            job.status == .waiting
-                && job.dolbyVisionProfile.map { DolbyVisionPlan.mode(forProfile: $0) != nil } == true
+            job.dolbyVisionProfile.map { DolbyVisionPlan.mode(forProfile: $0) != nil } == true
         }
     }
 
@@ -1166,8 +1192,9 @@ final class ConversionQueue {
     /// same switch is obviously right on a wasteful encode and a real loss on a disc
     /// master, and the file itself says which it is.
     var dolbyVisionAdvice: String {
-        let waiting = jobs.filter { $0.status == .waiting && $0.dolbyVisionProfile != nil }
-        let densities = waiting.compactMap(\.bitsPerPixel)
+        let densities = jobs
+            .filter { $0.dolbyVisionProfile != nil }
+            .compactMap(\.bitsPerPixel)
         let base = """
             Bring the picture down to the bit rate Immersive Cinema targets, keeping the \
             Dolby Vision — which its own optimizer can't, because re-encoding there loses \
@@ -1343,7 +1370,7 @@ final class ConversionQueue {
 
         let videoURL = scratch.appending(path: "video.hevc")
         let tracksURL = scratch.appending(path: "tracks.mp4")
-        let sourceBytes = (try? source.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init)
+        let sourceBytes = source.currentFileSize
 
         if let bitrate = plan.optimizedBitrate {
             // The RPU comes out first, the picture is re-encoded without it, and it goes
@@ -1376,7 +1403,7 @@ final class ConversionQueue {
                 doviTool,
                 arguments: plan.injectArguments(video: encodedURL, rpu: rpuURL, to: videoURL),
                 holding: { self.current = $0 },
-                expectedBytes: (try? encodedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init),
+                expectedBytes: encodedURL.currentFileSize,
                 watching: videoURL
             ) { onProgress(0.70 + $0 * 0.10) }
         } else {
@@ -1403,7 +1430,7 @@ final class ConversionQueue {
             mp4box,
             arguments: plan.muxArguments(video: videoURL, tracks: tracksURL, to: destination),
             holding: { self.current = $0 },
-            expectedBytes: (try? videoURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init),
+            expectedBytes: videoURL.currentFileSize,
             watching: destination
         ) { onProgress(0.85 + $0 * 0.15) }
     }
@@ -1414,7 +1441,7 @@ final class ConversionQueue {
     /// output lands within a few per cent of it either way — smaller when a fat lossless
     /// audio track becomes AAC, larger when nothing does.
     private func checkSpace(for source: URL, writingTo destination: URL) throws {
-        guard let needed = try? source.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+        guard let needed = source.currentFileSize,
               let free = try? destination.deletingLastPathComponent()
                   .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
                   .volumeAvailableCapacityForImportantUsage
@@ -1447,14 +1474,18 @@ final class ConversionQueue {
 
         do {
             let probe = try await Probe.read(source)
-            let plan = try Plan(for: probe, from: source, to: destination)
+            let dolbyVision = Self.dolbyVisionPlan(for: probe, optimizing: optimizesBitrate)
+            let plan = try Plan(
+                for: probe,
+                from: source,
+                to: destination,
+                isRebuildingDolbyVision: dolbyVision != nil
+            )
 
             // The output is about the size of the input — the video is usually copied
             // whole. Better to say so now than to fill the disk and fail at the far end of
             // an hour's work.
             try checkSpace(for: source, writingTo: destination)
-
-            let dolbyVision = Self.dolbyVisionPlan(for: probe, optimizing: optimizesBitrate)
             let summary = switch (dolbyVision, dolbyVision?.optimizedBitrate) {
             case (nil, _):
                 plan.summary
@@ -1506,8 +1537,7 @@ final class ConversionQueue {
 
             update(id) { job in
                 job.output = destination
-                job.outputBytes = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-                    .map(Int64.init)
+                job.outputBytes = destination.currentFileSize
                 job.status = .finished
             }
         } catch is CancellationError {
@@ -1642,7 +1672,7 @@ extension Process {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(400))
                 guard !Task.isCancelled else { return }
-                let written = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                let written = url.currentFileSize ?? 0
                 let fraction = min(Double(written) / Double(expected), 0.99)
                 await MainActor.run { onProgress(fraction) }
             }
@@ -1706,6 +1736,20 @@ extension Process {
 // MARK: - Files
 
 extension URL {
+    /// How large the file is now, asked afresh every time.
+    ///
+    /// Not `resourceValues(forKeys:)`, which caches what it read the first time and keeps
+    /// handing it back. That's harmless for a file sitting still and wrong for one being
+    /// written: a size polled while a mux was starting pinned the answer at nothing, so a
+    /// 64 GB result was measured, reported and displayed as zero bytes long after it had
+    /// finished. `FileManager` reads the file system each time it's asked.
+    nonisolated var currentFileSize: Int64? {
+        guard let size = try? FileManager.default
+            .attributesOfItem(atPath: path(percentEncoded: false))[.size] as? NSNumber
+        else { return nil }
+        return size.int64Value
+    }
+
     /// The containers worth offering to convert.
     ///
     /// MKV is the reason this app exists, but the same wall stands in front of everything
@@ -1779,7 +1823,7 @@ struct ContentView: View {
                 // the strength of the tools being installed put a control in the window
                 // that did nothing at all for a queue of ordinary files — pressed once,
                 // nothing changed, and it taught you not to trust the toolbar.
-                if queue.hasDolbyVisionWaiting {
+                if queue.hasDolbyVision {
                     @Bindable var queue = queue
                     Toggle(isOn: $queue.optimizesBitrate) {
                         Label("Optimize Dolby Vision", systemImage: "wand.and.sparkles")
