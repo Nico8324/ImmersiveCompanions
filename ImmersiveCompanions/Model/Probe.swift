@@ -99,8 +99,30 @@ struct Probe: Decodable {
         let bitRate: String?
     }
 
+    /// A chapter mark, which matters here only so a broken set can be spotted.
+    struct Chapter: Decodable {
+        let startTime: String?
+
+        var startInSeconds: Double { Double(startTime ?? "") ?? 0 }
+    }
+
     let streams: [Stream]
     let format: Format
+    let chapters: [Chapter]?
+
+    /// Whether the file's chapters run past the end of the file itself.
+    ///
+    /// They can, and a clip cut out of a longer film with `-c copy` is how: ffmpeg carries
+    /// the chapters over and rebases the first one, leaving the rest at offsets belonging to
+    /// the original. Copied onward, MP4Box imports them as a `text` track longer than the
+    /// media — and **AVFoundation takes an asset's duration from its longest track**, so a
+    /// two-minute file reports as an hour and fifty. Immersive Cinema reads `Video.duration`
+    /// straight off the file, so the library would show that runtime and believe it.
+    var hasChaptersPastTheEnd: Bool {
+        guard let chapters, !chapters.isEmpty, durationInSeconds > 0 else { return false }
+        // A little slack: the last chapter legitimately starts just before the end.
+        return chapters.contains { $0.startInSeconds > durationInSeconds + 1 }
+    }
 
     var durationInSeconds: Double {
         Double(format.duration ?? "") ?? 0
@@ -180,7 +202,7 @@ struct Probe: Decodable {
         let output = try await Process.output(of: ffprobe, arguments: [
             "-v", "error",
             "-print_format", "json",
-            "-show_format", "-show_streams",
+            "-show_format", "-show_streams", "-show_chapters",
             url.path(percentEncoded: false)
         ])
         let decoder = JSONDecoder()

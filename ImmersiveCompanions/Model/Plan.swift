@@ -73,6 +73,17 @@ extension Plan {
         if dropped > 0 {
             notes.append("\(dropped) image subtitle\(dropped == 1 ? "" : "s") dropped")
         }
+
+        // Chapters are carried across by default, which is right until they are wrong.
+        // A set running past the end of the file becomes a `text` track longer than the
+        // media, and AVFoundation takes an asset's duration from its longest track — so the
+        // library would read the runtime off that and show it. Better no chapters than a
+        // file that lies about how long it is.
+        if probe.hasChaptersPastTheEnd {
+            arguments += ["-map_chapters", "-1"]
+            notes.append("chapters dropped — they ran past the end of the file")
+        }
+
         return (arguments, notes, reencoding)
     }
 
