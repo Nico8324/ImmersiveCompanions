@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-13
+
+The first tagged release. It converts what Immersive Cinema cannot open, and — since the
+library dropped its own optimizer — it is now the only thing that re-encodes for it.
+
 ### Added
 
 - **`HDRMetadata`**, which carries the mastering display and content light level across a
@@ -18,42 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **[`Docs/measurements.md`](Docs/measurements.md)**, the record of the 42 encodes the
   settings below came out of — including the six that measured nothing at all, and the two
   that reversed a confident expectation.
-
-### Changed
-
-- **x265 instead of VideoToolbox**, at both encode sites, preset `ultrafast` with
-  `signhide=1`. Measured on a 4K Dolby Vision feature against its own 74 Mbps source:
-  **VideoToolbox needs 1.87× the bit rate for the same picture** — it reaches VMAF 93.74 at
-  30 Mbps where x265 is already there at 16. The output is both better and smaller; the cost
-  is time, about three hours for a feature against fifty minutes, paid once for a file kept
-  for good. The preset sounds wrong and isn't: across five presets the whole spread was 0.44
-  VMAF and none of it came from search effort — it was two switches, SAO and adaptive
-  quantisation, which x265 turns on from `veryfast` up and which each cost about 0.19 on
-  dark grainy film.
-- **The ladder targets what Apple ships, not what they publish.** Their tables are
-  explicitly "one possible set of bit rate variants", and their own reference stream runs
-  24.33 Mbps at 4K where the table gives 20 — their *second* rung is the table figure less
-  the 24 fps reduction, and their top rung is half again above it. Hence
-  `appleTopRungMultiplier`, which reproduces their 4K and 1080p rungs to within 3%. It
-  arrives now because it is only honest with an encoder good enough to earn it.
-- **`referenceBitrate` is one function.** The test for "is this worth re-encoding" and the
-  rate it is encoded to were separate calculations that happened to agree, and the
-  multiplier broke that: a 22 Mbps source passed a gate measured against 16 Mbps and came
-  out at 24, larger than it went in.
-- **Split into layers** — `App/`, `Model/`, `ViewModel/`, `Services/`, `Views/`. The
-  2,181-line `CinemaConverter.swift` is now fourteen files, divided along the `// MARK:`
-  boundaries that were already there. `Job` and its `Status` move out of `ConversionQueue`:
-  the queue owns the work, `Job` owns what a row has to say about a file.
-
-- **Now an Xcode project.** The app was a single Swift file built by `build.sh`; it is now
-  the `ImmersiveCompanions` target, and the shell script and the `CinemaConverter/` folder
-  are gone. Two settings differ from Xcode's macOS template on purpose: the App Sandbox is
-  off, because a sandboxed app can neither run the `ffmpeg` on your machine nor write beside
-  the file you gave it, and `Support/Info.plist` supplies `CFBundleDocumentTypes`, which has
-  no `INFOPLIST_KEY_` equivalent and without which Open With and Dock drops stop working.
-
-### Added
-
 - **Immersive Companions**, a Mac app that rewraps video into MP4 that Immersive Cinema can
   open. AVFoundation has no Matroska demuxer — `AVURLAsset` won't open an MKV at all, even
   when the streams inside are H.264 and AAC — and the app can't optimize its way out,
@@ -106,6 +75,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing toggle to look like a missing feature.
 - **Files can be dropped once the list has replaced the drop zone.**
 
+### Changed
+
+- **x265 instead of VideoToolbox**, at both encode sites, preset `ultrafast` with
+  `signhide=1`. Measured on a 4K Dolby Vision feature against its own 74 Mbps source:
+  **VideoToolbox needs 1.87× the bit rate for the same picture** — it reaches VMAF 93.74 at
+  30 Mbps where x265 is already there at 16. The output is both better and smaller; the cost
+  is time, about three hours for a feature against fifty minutes, paid once for a file kept
+  for good. The preset sounds wrong and isn't: across five presets the whole spread was 0.44
+  VMAF and none of it came from search effort — it was two switches, SAO and adaptive
+  quantisation, which x265 turns on from `veryfast` up and which each cost about 0.19 on
+  dark grainy film.
+- **The ladder targets what Apple ships, not what they publish.** Their tables are
+  explicitly "one possible set of bit rate variants", and their own reference stream runs
+  24.33 Mbps at 4K where the table gives 20 — their *second* rung is the table figure less
+  the 24 fps reduction, and their top rung is half again above it. Hence
+  `appleTopRungMultiplier`, which reproduces their 4K and 1080p rungs to within 3%. It
+  arrives now because it is only honest with an encoder good enough to earn it.
+- **`referenceBitrate` is one function.** The test for "is this worth re-encoding" and the
+  rate it is encoded to were separate calculations that happened to agree, and the
+  multiplier broke that: a 22 Mbps source passed a gate measured against 16 Mbps and came
+  out at 24, larger than it went in.
+- **Split into layers** — `App/`, `Model/`, `ViewModel/`, `Services/`, `Views/`. The
+  2,181-line `CinemaConverter.swift` is now fourteen files, divided along the `// MARK:`
+  boundaries that were already there. `Job` and its `Status` move out of `ConversionQueue`:
+  the queue owns the work, `Job` owns what a row has to say about a file.
+
+- **Now an Xcode project.** The app was a single Swift file built by `build.sh`; it is now
+  the `ImmersiveCompanions` target, and the shell script and the `CinemaConverter/` folder
+  are gone. Two settings differ from Xcode's macOS template on purpose: the App Sandbox is
+  off, because a sandboxed app can neither run the `ffmpeg` on your machine nor write beside
+  the file you gave it, and `Support/Info.plist` supplies `CFBundleDocumentTypes`, which has
+  no `INFOPLIST_KEY_` equivalent and without which Open With and Dock drops stop working.
+
 ### Fixed
 
 - **A re-encoded picture lost its colour description.** `hevc_videotoolbox` writes the
@@ -144,3 +146,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `+faststart`. It front-loads the index for players reading over HTTP, which is worth
   nothing for a local library, and costs a rewrite proportional to the whole file.
+
+[Unreleased]: https://github.com/Nico8324/ImmersiveCompanions/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Nico8324/ImmersiveCompanions/releases/tag/v0.1.0
