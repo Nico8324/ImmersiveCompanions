@@ -74,25 +74,33 @@ Cover-art "video" streams are skipped, so a poster doesn't become the film.
 
 ### When it does re-encode
 
-The settings are Immersive Cinema's own `PlaybackTarget`, transcribed — not an
-approximation. Deferring the bit rate question to the library works for a stream copy, but a
-re-encode here is *final*: the optimizer will judge what it finds, find an HEVC file inside
-its tolerance, and quite correctly leave it alone.
+This is the only place a re-encode happens for the library. Immersive Cinema used to carry
+its own optimizer and no longer does — through `AVAssetWriter` it could reach only
+VideoToolbox, which needs 1.87× the bit rate for the same picture, and it could not carry
+Dolby Vision across at all. So what comes out of here is what gets kept, with nothing
+downstream to correct it.
 
-- **HEVC** via VideoToolbox, tagged `hvc1`
+- **HEVC** via **x265**, tagged `hvc1`, at preset `ultrafast` with `signhide=1`
 - **Bit rate** = `min(Apple's rung for the frame, what the source was already spending × a
   codec ratio)`. Rungs from the HLS Authoring Specification, chosen by pixel count rather
-  than height, ×1.5 above 33 fps, with the HDR uplift. The ratio is 0.65 from H.264, 0.95
-  from VP9, **1.3 from AV1** — AV1 does more with its bits than HEVC can
-- **Key frames** every 2 seconds
-- **Main 10 / P010 / Rec. 2020** for HDR, **Main / 8-bit / Rec. 709** for SDR, with the
-  colour description written into the bitstream — VideoToolbox drops two thirds of it
-  otherwise, and an untagged HDR picture is the washed-out grey one
+  than height, less 20% for 24 fps content as the specification asks, then **×1.5 — because
+  Apple does not ship the top of their own published tables**. The codec ratio is 0.65 from
+  H.264, 0.95 from VP9, **1.3 from AV1** — AV1 does more with its bits than HEVC can
+- **Key frames** every 2 seconds, closed
+- **Peak held to twice the average**, which is what the specification asks of VOD (1.30)
+- **Main 10 / 10-bit / Rec. 2020** for HDR, **8-bit / Rec. 709** for SDR, with the mastering
+  display and content light level carried across (1.35) and the colour description written
+  into the bitstream as well
 - **Never resized.** The frame that goes in is the frame that comes out
 
-A worked example: a 1.8 Mbps VP9 file re-encodes at 1.66 Mbps, not Apple's 10 Mbps rung for
-1080p. Detail a file has already thrown away doesn't come back when you spend more bits on
-it — it would just be five times the size and no better.
+Two worked examples. A 1.8 Mbps VP9 file re-encodes at 1.66 Mbps, not Apple's rung for
+1080p — detail a file has already thrown away doesn't come back when you spend more bits on
+it. A 74 GB 4K Dolby Vision remux comes out at 22.9 GB, a 3.25× reduction, scoring **VMAF
+96.8** against its own source with the Dolby Vision intact.
+
+Every number above was measured rather than assumed, across 42 encodes.
+**[The measurements are written up in `Docs/measurements.md`](Docs/measurements.md)** —
+including the several that contradicted what this code used to do.
 
 ## Dolby Vision
 

@@ -52,8 +52,29 @@ brew install ffmpeg dovi_tool gpac
 
 ## Architecture
 
-One Swift file, divided by `// MARK:` sections. SwiftUI, `@Observable`, **Swift 6 language
-mode** — `SWIFT_VERSION = 6.0`, so strict concurrency is on and the compiler enforces it.
+Layered into `App/`, `Model/`, `ViewModel/`, `Services/` and `Views/`. SwiftUI,
+`@Observable`, **Swift 6 language mode** — `SWIFT_VERSION = 6.0`, so strict concurrency is
+on and the compiler enforces it.
+
+- **Model** is data and decisions: `Probe` (what ffprobe found), `Plan` (what to do about
+  it), `DolbyVisionPlan`, `PlaybackTarget` (the encode aimed for), `Job`, `ConversionError`.
+- **ViewModel** is `ConversionQueue` alone — the queue, the running job, and the state the
+  window draws from.
+- **Services** are the things that touch the world: `Tools` (finding the binaries),
+  `ProcessRunner`, `Thumbnail`, `HDRMetadata`, `Verification`, `FileSupport`.
+- **Views** know about `ConversionQueue`, `Job` and `Tools`, and nothing else. Keep it that
+  way — a view reaching for `Process` or `Probe` is the signal the layering has slipped.
+
+`ImmersiveCompanions/` is a **file-system–synchronized group**, the same as the library's
+target: a file dropped in the folder joins the build with no project-file edit, so a stray
+scratch file gets compiled into the app.
+
+**Why the encoder settings are what they are is written up in
+[`Docs/measurements.md`](Docs/measurements.md)** — 42 encodes, and several results that
+contradicted what this code did beforehand. Read it before touching `PlaybackTarget`. Two
+traps from it worth knowing up front: `tune` passed inside `--x265-params` is silently
+ignored, and a preset is not a neutral baseline for testing the things the preset itself
+switches off — six settings that looked like clean null results were measuring nothing.
 
 The thing that model turns on here: every progress callback is typed
 `@escaping @MainActor (Double) -> Void`, and `holding` likewise. They're called from a
