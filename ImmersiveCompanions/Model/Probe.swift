@@ -22,10 +22,43 @@ struct Probe: Decodable {
         let rFrameRate: String?
         let sideDataList: [SideData]?
         let tags: [String: String]?
+        /// ffprobe's per-stream flags — `default`, `forced`, `comment`,
+        /// `hearing_impaired`, `visual_impaired` and the rest — each `0` or `1`. Absent
+        /// entirely on some builds rather than merely `0`, so every read goes through
+        /// `disposition?[name] ?? 0`.
+        let disposition: [String: Int]?
 
         /// The Dolby Vision record on this stream, if it carries one.
         var dolbyVision: SideData? {
             sideDataList?.first { $0.dvProfile != nil }
+        }
+
+        /// The language this track is tagged with, exactly as ffprobe reports it — or
+        /// `nil` when there's nothing to preserve, which is both a missing tag and an
+        /// explicit `und`. Matroska writes `und` on a track nobody set a language for, so
+        /// treating the two differently would only mean writing `language=und` back out by
+        /// hand instead of leaving it unset.
+        var language: String? {
+            guard let language = tags?["language"], !language.isEmpty, language != "und" else { return nil }
+            return language
+        }
+
+        /// Whether ffprobe's disposition marks this track forced: dialogue or on-screen
+        /// text a viewer can't get any other way, as opposed to a track that's merely
+        /// available.
+        var isForced: Bool { (disposition?["forced"] ?? 0) != 0 }
+
+        /// Whether this audio track is a second programme rather than a duplicate mix of
+        /// the main one — commentary, or a mix meant for viewers who are deaf, hard of
+        /// hearing, blind or visually impaired. Losing one of these changes what the film
+        /// contains, not merely how it's encoded, so it's kept alongside the main track
+        /// rather than folded into the per-language de-duplication that drops an AC-3 core
+        /// sitting next to the TrueHD it was struck from.
+        var isSecondaryAudioProgramme: Bool {
+            let flagged = ["comment", "visual_impaired", "hearing_impaired"]
+                .contains { (disposition?[$0] ?? 0) != 0 }
+            let titled = (tags?["title"] ?? "").localizedCaseInsensitiveContains("commentary")
+            return flagged || titled
         }
 
         /// What this track alone is spending, in bits per second, or `nil` if it won't say.

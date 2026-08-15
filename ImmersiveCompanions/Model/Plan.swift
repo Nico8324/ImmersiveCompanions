@@ -38,6 +38,128 @@ struct Plan {
 }
 
 extension Plan {
+    /// One audio track as it survives into the output: which source stream it comes from,
+    /// and how it gets there.
+    private struct AudioTrack {
+        let stream: Probe.Stream
+        let isCopy: Bool
+        /// Set only when transcoding.
+        let targetCodec: String?
+        let bitrate: String?
+    }
+
+    /// The display name for a codec MP4 can hold, for the note that says a track was
+    /// converted to it. `AAC` and `HEVC` read fine uppercased; the hyphenated Dolby names
+    /// don't.
+    private static func displayName(forAudioCodec codec: String) -> String {
+        switch codec {
+        case "eac3": "E-AC-3"
+        case "ac3": "AC-3"
+        default: codec.uppercased()
+        }
+    }
+
+    /// Groups the file's audio by language, keeps one main track per group plus anything
+    /// that's a different programme rather than a duplicate of it, and decides how each
+    /// surviving track reaches the output.
+    ///
+    /// A remux carrying TrueHD Atmos alongside the AC-3 core it was struck from used to
+    /// keep both — two near-identical 5.1 tracks, the length of the film again in disk for
+    /// nothing — and transcoded lossless multichannel to AAC, a codec Apple uses for
+    /// stereo, not surround. Now one main track survives per language, chosen by what it
+    /// costs to keep: E-AC-3 is copied first because it's the only one of these that can
+    /// carry Atmos's JOC metadata, then AC-3, then whatever else MP4 already holds without
+    /// transcoding. Only when nothing in the language passes through is anything
+    /// transcoded, and then it's the richest source — most channels — that's picked.
+    ///
+    /// A stray stereo track never wins over a surround mix merely for already being in a
+    /// copyable codec: if the best passthrough candidate is stereo and the language also
+    /// carries a multichannel mix, the multichannel one is taken and transcoded instead.
+    /// Keeping a film's 7.1 as E-AC-3 costs a lossy generation; keeping its stereo instead
+    /// would cost the surround programme itself.
+    ///
+    /// Commentary and accessibility mixes are a different programme, not a duplicate mix,
+    /// so they survive alongside the main track rather than being folded into it.
+    private static func selectAudioTracks(from probe: Probe) -> (tracks: [AudioTrack], notes: [String]) {
+        // E-AC-3 first: the one route here that can preserve Atmos's JOC metadata rather
+        // than merely the discrete channels under it.
+        let passthroughPriority: [String: Int] = ["eac3": 0, "ac3": 1, "aac": 2, "alac": 2, "mp3": 2]
+
+        // Grouped in the file's own order, so a language that appears twice doesn't have
+        // its tracks reshuffled to wherever the second group happened to start.
+        var order: [String] = []
+        var groups: [String: [Probe.Stream]] = [:]
+        for stream in probe.audioStreams {
+            let key = stream.language ?? "und"
+            if groups[key] == nil { order.append(key) }
+            groups[key, default: []].append(stream)
+        }
+
+        var kept: Set<Int> = []
+        var duplicatesDropped = 0
+
+        for key in order {
+            let streams = groups[key] ?? []
+            let secondary = streams.filter(\.isSecondaryAudioProgramme)
+            let candidates = streams.filter { !$0.isSecondaryAudioProgramme }
+
+            // Best copyable candidate first by codec, with channel count breaking ties —
+            // a 5.1 AC-3 beats a stereo AC-3, not just a stereo AAC.
+            let byPriority = candidates.compactMap { stream in
+                passthroughPriority[stream.codecName ?? ""].map { (stream, $0) }
+            }
+            let bestPassthrough = byPriority.min {
+                ($0.1, -($0.0.channels ?? 0)) < ($1.1, -($1.0.channels ?? 0))
+            }?.0
+            let richest = candidates.max { ($0.channels ?? 0) < ($1.channels ?? 0) }
+
+            if let main = bestPassthrough,
+               (main.channels ?? 0) > 2 || (richest?.channels ?? 0) <= 2 {
+                kept.insert(main.index)
+            } else if let richest {
+                kept.insert(richest.index)
+            }
+            if candidates.count > 1 { duplicatesDropped += candidates.count - 1 }
+            kept.formUnion(secondary.map(\.index))
+        }
+
+        // Back into the file's own order for the arguments themselves, so a track's
+        // position in the output says as little as possible about which language group it
+        // came from.
+        let orderedKept = probe.audioStreams.filter { kept.contains($0.index) }
+
+        var notes: [String] = []
+        let tracks: [AudioTrack] = orderedKept.map { stream in
+            let codec = stream.codecName ?? ""
+            guard !passthroughAudio.contains(codec) else {
+                return AudioTrack(stream: stream, isCopy: true, targetCodec: nil, bitrate: nil)
+            }
+            // The bit rates Immersive Cinema's own target uses, so a file converted here
+            // and a file optimized there sound the same. Multichannel now lands on E-AC-3
+            // rather than AAC — the format Apple actually ships surround sound in, where
+            // AAC is what it ships stereo in.
+            let channels = stream.channels ?? 2
+            let targetCodec = channels > 2 ? "eac3" : "aac"
+            let bitrate = channels > 2 ? "640k" : "256k"
+            notes.append("\(codec.uppercased()) → \(displayName(forAudioCodec: targetCodec))")
+            return AudioTrack(stream: stream, isCopy: false, targetCodec: targetCodec, bitrate: bitrate)
+        }
+        if duplicatesDropped > 0 {
+            notes.append("\(duplicatesDropped) duplicate audio track\(duplicatesDropped == 1 ? "" : "s") dropped")
+        }
+
+        return (tracks, notes)
+    }
+
+    /// The `-disposition` flags worth preserving on a subtitle track carried into the
+    /// output: `forced`, because that's what marks the translated dialogue MP4 keeps, and
+    /// `default` alongside it when the source set both, since asking ffmpeg for one
+    /// replaces whatever disposition the track already had rather than adding to it.
+    private static func dispositionArgument(for stream: Probe.Stream) -> String? {
+        guard stream.isForced else { return nil }
+        return (stream.disposition?["default"] ?? 0) != 0 ? "default+forced" : "forced"
+    }
+
     /// How the audio and subtitles are handled, which is the same either route.
     static func trackArguments(
         for probe: Probe
@@ -46,32 +168,57 @@ extension Plan {
         var notes: [String] = []
         var reencoding = false
 
-        // Audio: every track, so a film keeps its other languages, each judged on its own.
-        for (offset, stream) in probe.audioStreams.enumerated() {
-            arguments += ["-map", "0:\(stream.index)"]
-            let audioCodec = stream.codecName ?? ""
-            if passthroughAudio.contains(audioCodec) {
+        let audio = Plan.selectAudioTracks(from: probe)
+        for (offset, track) in audio.tracks.enumerated() {
+            arguments += ["-map", "0:\(track.stream.index)"]
+            if track.isCopy {
                 arguments += ["-c:a:\(offset)", "copy"]
             } else {
                 reencoding = true
-                notes.append("\(audioCodec.uppercased()) → AAC")
-                // The bit rates Immersive Cinema's own target uses, so a file converted
-                // here and a file optimized there sound the same.
-                let bitrate = (stream.channels ?? 2) > 2 ? "640k" : "256k"
-                arguments += ["-c:a:\(offset)", "aac", "-b:a:\(offset)", bitrate]
+                arguments += ["-c:a:\(offset)", track.targetCodec!, "-b:a:\(offset)", track.bitrate!]
+            }
+            // A mapped stream keeps its language by default in the plain route, but the
+            // Dolby Vision route carries it through an audio-only intermediate that MP4Box
+            // then imports separately, and a file was observed coming out the far end of
+            // that with `language: und` on every track. Writing it explicitly here, rather
+            // than trusting it to travel implicitly through ffmpeg and then GPAC, is what
+            // fixes that: MP4Box's default import reads a track's language straight off the
+            // source file it's given, so as long as the intermediate has the right tag on
+            // it, so does the file built from it.
+            if let language = track.stream.language {
+                arguments += ["-metadata:s:a:\(offset)", "language=\(language)"]
             }
         }
+        notes += audio.notes
+        reencoding = reencoding || audio.tracks.contains { !$0.isCopy }
 
         // Subtitles: only the ones MP4 can hold.
         let text = probe.subtitleStreams.filter { textSubtitles.contains($0.codecName ?? "") }
-        for stream in text {
+        for (offset, stream) in text.enumerated() {
             arguments += ["-map", "0:\(stream.index)"]
+            if let disposition = Plan.dispositionArgument(for: stream) {
+                arguments += ["-disposition:s:\(offset)", disposition]
+            }
+            if let language = stream.language {
+                arguments += ["-metadata:s:s:\(offset)", "language=\(language)"]
+            }
         }
         arguments += text.isEmpty ? ["-sn"] : ["-c:s", "mov_text"]
 
-        let dropped = probe.subtitleStreams.count - text.count
-        if dropped > 0 {
-            notes.append("\(dropped) image subtitle\(dropped == 1 ? "" : "s") dropped")
+        // Everything not carried across as text: PGS and VobSub, which have no home in
+        // MP4, and the odd text codec ffmpeg can't remux into `mov_text`. A forced one
+        // among them is worth saying so specifically — it's dialogue or on-screen text a
+        // viewer can't get any other way, not a spare a film merely offered.
+        let dropped = probe.subtitleStreams.filter { !textSubtitles.contains($0.codecName ?? "") }
+        let droppedForced = dropped.filter(\.isForced)
+        if !droppedForced.isEmpty {
+            notes.append(droppedForced.count == 1
+                ? "a forced subtitle track was dropped — the film may need an external subtitle file"
+                : "\(droppedForced.count) forced subtitle tracks were dropped — the film may need an external subtitle file")
+        }
+        let droppedOther = dropped.count - droppedForced.count
+        if droppedOther > 0 {
+            notes.append("\(droppedOther) image subtitle\(droppedOther == 1 ? "" : "s") dropped")
         }
 
         // Chapters are carried across by default, which is right until they are wrong.

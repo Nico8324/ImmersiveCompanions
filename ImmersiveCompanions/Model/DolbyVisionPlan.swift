@@ -154,6 +154,17 @@ struct DolbyVisionPlan {
     /// `dvp=8.hdr10` is profile 8 with the HDR10 compatibility ID — 8.1, written so a
     /// player that doesn't know Dolby Vision still sees a correct HDR10 picture. The frame
     /// rate has to be given because a raw stream carries no timing of its own.
+    ///
+    /// `tracks` is added whole rather than track by track. MP4Box's per-track `lang=`
+    /// import option would need every track in `tracks` enumerated by ID, and that file can
+    /// carry an extra one this app never asked for — ffmpeg appends a `text` track of its
+    /// own for chapters, which isn't accounted for anywhere else here — so guessing at IDs
+    /// risks silently dropping the chapters rather than fixing a language tag. Importing
+    /// the source whole avoids that, and it doesn't cost the language: MP4Box's default
+    /// import already reads each track's language straight off the source file, which is
+    /// what actually matters — `Plan.trackArguments` writes it onto the intermediate
+    /// explicitly rather than trusting it to arrive there implicitly, and this is what
+    /// then carries it the rest of the way through.
     func muxArguments(video: URL, tracks: URL, to destination: URL) -> [String] {
         [
             "-quiet",
