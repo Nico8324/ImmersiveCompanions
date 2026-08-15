@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-15
+
+The file the app produces is now shaped the way Apple ships its own: letterbox bars
+cropped to the studio's declared geometry, one audio track per language, subtitles
+suppliable as text files beside the source, and no chapters — verified, all of it, before
+a file is called done.
+
 ### Added
 
 - **Sidecar subtitle files are folded into the output as native text tracks.** Blu-ray rips
