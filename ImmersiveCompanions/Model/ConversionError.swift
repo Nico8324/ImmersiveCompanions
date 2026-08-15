@@ -12,6 +12,7 @@ enum ConversionError: LocalizedError {
     case noVideo
     case notEnoughSpace(needed: Int64, free: Int64)
     case unplayableResult
+    case dolbyVisionLost
     case failed(String)
 
     var errorDescription: String? {
@@ -25,6 +26,9 @@ enum ConversionError: LocalizedError {
             return "Not enough room: needs about \(needed.formatted(format)), \(free.formatted(format)) free."
         case .unplayableResult:
             return "The converted file came out unplayable, so it was deleted rather than left for you to find later."
+        case .dolbyVisionLost:
+            return "The Dolby Vision RPU didn’t survive the rebuild, so the file was deleted rather than kept " +
+                "looking like Dolby Vision when it no longer is."
         case .failed(let message):
             return message.isEmpty ? "The conversion failed." : message
         }

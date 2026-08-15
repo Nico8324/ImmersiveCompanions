@@ -431,7 +431,7 @@ final class ConversionQueue {
                 )
             }
 
-            try await Verification.check(destination)
+            try await Verification.check(destination, wasRebuiltAsDolbyVision: dolbyVision != nil)
 
             update(id) { job in
                 job.output = destination

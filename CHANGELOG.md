@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The Dolby Vision route now checks its own claim.** `Verification` asked AVFoundation
+  whether a file was playable, which says nothing about whether the RPU `dovi_tool`
+  extracted actually landed back on the right frames — a misaligned re-injection still
+  opens, enumerates and plays. For a file that went through the Dolby Vision route, ffprobe
+  now reads the frame side data over a couple of seconds at the start of the file and again
+  near the end, and the conversion fails if "Dolby Vision RPU" isn't there. Cheap by
+  `-read_intervals`, which limits ffprobe to the seconds named rather than decoding
+  everything in between; two points a feature apart rather than one, so a rebuild that only
+  went wrong partway through doesn't pass on the strength of its first few frames.
+
+### Changed
+
+- **One audio track per language, not every track.** A remux carrying TrueHD Atmos
+  alongside the AC-3 core it was struck from used to keep both — two near-identical 5.1
+  tracks, the length of the film again in disk for nothing — and transcoded lossless
+  multichannel to AAC, a codec Apple uses for stereo, not surround. Streams are now grouped
+  by language, and each keeps one main track, chosen by what survives the trip without
+  transcoding: E-AC-3 first, since it's the only one of these that can carry Atmos's JOC
+  metadata, then AC-3, then whatever else MP4 already holds. Only when nothing in the
+  language passes through does anything get transcoded, and multichannel now lands on
+  E-AC-3 at 640 kbps rather than AAC — stereo still gets AAC at 256 kbps. Commentary and
+  accessibility mixes (`comment`, `hearing_impaired`, `visual_impaired` in the source's
+  disposition, or a title that says "commentary") are a different programme, not a
+  duplicate, so they're kept alongside the main track rather than dropped or folded into it.
+- **A forced subtitle track being dropped now says so specifically.** PGS and VobSub have
+  nowhere to go in MP4 and always got dropped; the note used to just count them. A forced
+  track among the dropped ones carries dialogue or on-screen text a viewer can't get any
+  other way, and losing it changes what the film contains rather than merely trims a spare
+  — so it now gets its own note: "a forced subtitle track was dropped — the film may need an
+  external subtitle file". Text-based forced subtitles that do survive into `mov_text` keep
+  their forced disposition in the output, which they weren't asked to before.
+- **Audio and subtitle language tags are now written explicitly**, with
+  `-metadata:s:a:N language=` and `-metadata:s:s:N language=`, rather than left to travel
+  through ffmpeg's mapping implicitly. A file was observed coming out of the Dolby Vision
+  route with `language: und` on every track — the intermediate ffmpeg builds for MP4Box to
+  import carries the audio and subtitles alone, and nothing was asking it to keep the tag.
+  Writing it explicitly onto that intermediate is what fixes it: MP4Box's default import
+  already reads a track's language straight off the file it's given, so what matters is that
+  the file it's given has the tag on it.
+
 ## [0.1.0] - 2026-08-13
 
 The first tagged release. It converts what Immersive Cinema cannot open, and — since the

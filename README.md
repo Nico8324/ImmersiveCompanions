@@ -61,7 +61,7 @@ making. So:
 | Stream | Kept as-is | Re-encoded |
 | --- | --- | --- |
 | Video | H.264, HEVC | everything else → HEVC (VideoToolbox), at the source's own bit rate |
-| Audio | AAC, AC-3, E-AC-3, ALAC, MP3 | everything else → AAC, 256 kbps stereo / 640 kbps surround |
+| Audio | AAC, AC-3, E-AC-3, ALAC, MP3 | everything else → E-AC-3, 640 kbps surround / AAC, 256 kbps stereo |
 | Subtitles | SRT, ASS, WebVTT → `mov_text` | PGS and VobSub are dropped — MP4 has nowhere to put them |
 
 A typical MKV is H.264 or HEVC with AAC or AC-3, so the usual result is a **stream copy**:
@@ -69,8 +69,32 @@ a couple of seconds, byte-for-byte identical picture, no quality lost. The row t
 which you got — "Rewrapped, nothing re-encoded" or what was converted and why.
 
 Also carried across: **chapters**, HDR colour tags, mastering-display and content-light
-metadata, per-track languages, and every audio track so a film keeps its other languages.
-Cover-art "video" streams are skipped, so a poster doesn't become the film.
+metadata, and per-track languages. Cover-art "video" streams are skipped, so a poster
+doesn't become the film.
+
+### Audio: one main track per language
+
+A film's audio is grouped by language rather than mapped track for track. A remux carrying
+TrueHD Atmos alongside the AC-3 core it was struck from used to keep both — two
+near-identical 5.1 tracks, the length of the film again in disk for nothing. Now each
+language keeps one main track, chosen by what survives the trip without transcoding at all:
+
+1. **E-AC-3**, copied — the only one of these that can carry Atmos's JOC metadata across
+2. **AC-3**, copied
+3. **AAC, ALAC or MP3**, copied
+4. Otherwise, the richest remaining source — most channels wins — transcoded to **E-AC-3 at
+   640 kbps** if it has more than two channels, **AAC at 256 kbps** if it doesn't
+
+Commentary and accessibility mixes are a different programme, not a duplicate of the main
+one, and survive alongside it regardless of language: anything the source's disposition
+marks `comment`, `hearing_impaired` or `visual_impaired`, or whose title says "commentary",
+is kept and — if it isn't already a format MP4 holds — transcoded by the same rule above.
+The row's summary says what happened: "TRUEHD → E-AC-3", "2 duplicate audio tracks
+dropped".
+
+Every surviving track keeps the language tag it came in with, written explicitly rather
+than left to travel through ffmpeg and, on the Dolby Vision route, GPAC implicitly — a file
+was once observed coming out the far end with `und` on every track.
 
 ### When it does re-encode
 
@@ -166,6 +190,13 @@ video track and duration checked, and an `AVAssetReader` constructed — the sam
 Immersive Cinema's optimizer does first. A file that fails is deleted rather than left
 looking importable.
 
+For a file that went through the Dolby Vision route, that isn't enough — a misaligned
+`inject-rpu` still opens, enumerates and plays; it just isn't Dolby Vision any more, and
+AVFoundation has no opinion on that either. So ffprobe is asked directly for the one thing
+that says so: RPU side data on the frames themselves, sampled over a couple of seconds at
+the start of the file and again near the end, cheaply, with `-read_intervals` rather than
+by decoding the whole thing. Missing it fails the conversion the same as an unplayable file.
+
 It also refuses to start when the disk can't hold the result, rather than filling it and
 failing an hour in.
 
@@ -228,12 +259,15 @@ the app knows to leave Dolby Vision alone.
 
 ## Known limits
 
-- **Atmos in TrueHD can't survive.** MP4 has no mapping for TrueHD, and no free encoder
-  produces E-AC-3 with JOC — Dolby's own engine is licensed. You keep the discrete channels
-  as AAC, and any AC-3 track is copied untouched for receiver passthrough. **Atmos already
-  carried as E-AC-3 is copied, and survives intact.**
-- **PGS and VobSub subtitles are dropped.** MP4 has nowhere to put them. Losing *forced*
-  subtitles makes foreign-language scenes unwatchable, so check before relying on it.
+- **Atmos in TrueHD can't survive unless an E-AC-3 track sits alongside it.** MP4 has no
+  mapping for TrueHD, and no free encoder produces E-AC-3 with JOC — Dolby's own engine is
+  licensed. **Atmos already carried as E-AC-3 is copied, and survives intact.** Without one,
+  the language's main track falls back to a plain AC-3 core if the disc offers one, or the
+  discrete channels transcoded to E-AC-3 (without JOC) otherwise — either way you lose the
+  object-based mix, not the surround channels under it.
+- **PGS and VobSub subtitles are dropped.** MP4 has nowhere to put them. A dropped *forced*
+  track gets its own warning, since losing one changes what the film contains rather than
+  merely trims a spare — but check before relying on it regardless.
 - **Variable frame rate** isn't handled on the Dolby Vision route: a raw stream carries no
   timing, so GPAC is given one rate. Films are constant rate; camera footage may not be.
 - **HDR stills are converted, not tone mapped.** A frame from a PQ or HLG file is labelled
@@ -246,6 +280,9 @@ the app knows to leave Dolby Vision alone.
   branch for non-HEVC sources *has* now been run end to end — a VP9 and Opus file arrived as
   HEVC tagged `hvc1`, key frames exactly every 2 seconds, Rec. 709 fully tagged, at 1.65
   Mbps against a source asking 1.8 — but only on synthetic footage, and only in SDR.
+  The one-track-per-language audio selection and the Dolby Vision RPU spot check are new
+  and verified against synthetic multi-track files built for the purpose, not yet against a
+  real multi-language, multi-commentary disc remux.
 
 ## Licence
 
