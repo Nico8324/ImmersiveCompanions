@@ -22,6 +22,12 @@ than into the measurements themselves.
   equally. This one decision mattered more than any encoder setting; without it the
   differences below mostly vanish into the high nineties.
 
+  A later reading of the film's own Dolby Vision Level 5 metadata put the bars at 276 rows
+  each — the active picture is 3840×1608, not the 3840×1600 assumed here — so this crop
+  scored 8 rows inside the real picture. Harmless for these measurements, which only needed
+  the same crop on both sides of every comparison, but the app's letterbox removal uses
+  Dolby's own 276, not this 280.
+
 ## The result the app is built on
 
 | bit rate | x265 | VideoToolbox |

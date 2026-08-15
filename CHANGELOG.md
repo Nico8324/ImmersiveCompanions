@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sidecar subtitle files are folded into the output as native text tracks.** Blu-ray rips
+  carry their major-language subtitles as PGS images, which have nowhere to go in MP4 and
+  get dropped, so a converted film could end up with ten minor-language text tracks and no
+  English at all. A plain-text file named after the source and sitting beside it —
+  `Movie.srt`, `Movie.eng.srt`, `Movie.en.forced.srt`, `Movie.fre.sdh.srt` — is now muxed in
+  as a `mov_text` track, the same way Apple's own pipeline receives subtitles as text files
+  from studios. New service `SidecarSubtitle` finds them by exact stem match — `Movie2.srt`
+  never matches `Movie.mkv` — and reads a 2- or 3-letter dotted component as an ISO 639
+  language tag (passed through as given, no mapping table), `forced` and `sdh` as their
+  dispositions.
+  Each file is sanity-checked before it's trusted with anything: unreadable or empty files
+  are skipped, and one whose last cue runs more than about ten minutes past the probed
+  duration is treated as belonging to a different cut and skipped too, with a note either
+  way rather than a silent guess. Wired into both routes — `Plan.trackArguments` now takes
+  sidecars as additional ffmpeg inputs, mapped by input index after the source, with output
+  subtitle stream indices counted from the source's own text tracks first so existing
+  dispositions and language metadata land on the right streams. No charset conversion is
+  attempted; ffmpeg expects UTF-8, and a file that isn't fails to read here the same way it
+  would fail to mux.
+- **Letterbox bars are now cropped away when a Dolby Vision picture is re-encoded anyway.**
+  Apple's own store encodes carry no bars — the frame is the active picture — and this app
+  used to keep whatever the source declared. A Dolby Vision RPU's Level 5 metadata already
+  says exactly where the studio put its bars, so a new service, `DolbyVisionCrop`, reads it
+  straight from the source: three short samples near the start, middle and end are demuxed
+  and handed to `dovi_tool export -d level5=`, and the crop is applied only when all three
+  agree exactly, the offsets survive 4:2:0 subsampling, and the result leaves a real picture
+  behind. A film whose framing genuinely changes partway through — an IMAX shot opening into
+  open matte — disagrees between samples and correctly keeps its bars. Wired into the Dolby
+  Vision re-encode path only: cropping needs real pixels moved, since the lossless
+  alternatives both play back wrong through AVPlayer, so a plain HDR10/SDR file, the copy
+  path, and the Dolby Vision route that doesn't re-encode all keep their bars untouched.
+  `PlaybackTarget`'s bit-rate rung is now chosen from the cropped frame rather than the
+  padded one, and `dovi_tool`'s `--crop` flag, passed on the pass that extracts the RPU,
+  zeroes the RPU's own offsets so the metadata stops describing bars that no longer exist. `Verification` now confirms the
+  output's natural size actually came out cropped, deleting the file rather than keeping one
+  whose crop silently failed.
 - **The Dolby Vision route now checks its own claim.** `Verification` asked AVFoundation
   whether a file was playable, which says nothing about whether the RPU `dovi_tool`
   extracted actually landed back on the right frames — a misaligned re-injection still
@@ -48,6 +84,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Writing it explicitly onto that intermediate is what fixes it: MP4Box's default import
   already reads a track's language straight off the file it's given, so what matters is that
   the file it's given has the tag on it.
+
+### Fixed
+
+- **A Chinese subtitle track came out labelled Norwegian.** Writing language tags onto the
+  Dolby Vision route's intermediate — the change directly above — surfaced a GPAC bug this
+  app now works around: `MP4Box -add`'s whole-file import corrupts the ISO 639-2
+  *bibliographic* code `chi` (what Matroska sources typically carry for Chinese) into `nor`.
+  Reproduced on this machine: `chi → nor`, while `zho`, `fra`, `deu`, `nld` and the other
+  *terminological* codes pass through the same import unchanged. A converted film's two
+  Chinese subtitle tracks were labelled Norwegian as a result. Every site that writes a
+  `language=` metadata argument — audio, source subtitles, sidecar subtitles, in
+  `Plan.swift` — now normalises all twenty ISO 639-2 B/T pairs to their terminological code
+  before writing it, since that's the code every tool in the chain, GPAC included, reads
+  back as given; a code with no B/T split, such as `eng`, passes through untouched.
+### Removed
+
+- **Chapters are no longer carried into the output, on either route.** The decision is
+  parity with Apple's own store files, which don't ship chapters at all — matching them is
+  the rule now, not merely a fallback for a broken case. It also removes a defect that
+  parity happens to fix as a side effect: ffmpeg writes a file's chapters as a timed-text
+  track (`SubtitleHandler`, `tref 'chap'`) alongside the real chapter atom, and on the Dolby
+  Vision route, MP4Box's whole-file import of the audio-and-subtitles intermediate used to
+  turn that timed-text track into ordinary chapter metadata — fine while the intermediate
+  carried audio alone, but once it also carries `mov_text` subtitle tracks (embedded, or
+  added by the sidecar-subtitle feature above), the same import instead reads it as a
+  `bin_data` track running the length of the film: a phantom stream in the output, while the
+  chapters, confusingly, still also arrived correctly. `Plan.trackArguments` now passes
+  `-map_chapters -1` unconditionally rather than only when a chapter set ran past the end of
+  the file, which drops chapters — and the phantom track with them — on both routes at once.
+  Verified against the installed `MP4Box`: an intermediate built this way, muxed through
+  MP4Box alongside a `mov_text` track, comes out with no chapters and no phantom stream.
+  `Probe.hasChaptersPastTheEnd` and its past-the-end special case are gone with it — nothing
+  needed the distinction once chapters are never carried either way.
 
 ## [0.1.0] - 2026-08-13
 

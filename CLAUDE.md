@@ -135,8 +135,17 @@ output is `dvp=8.hdr10` (profile 8.1) so a player that doesn't know Dolby Vision
 correct HDR10. Without `dovi_tool` and `MP4Box` the file still converts, as its HDR10 base
 layer — never refuse the job over a missing optional tool.
 
-**Never resize or resample.** The RPU re-injection in the Optimize path only lines up
-because the encode changes neither frame count nor frame rate.
+**Never resample, and never resize beyond cutting Dolby Vision's own declared bars.** The RPU
+re-injection in the Optimize path only lines up because the encode changes neither frame
+count nor frame rate — that much is still absolute. What can change is the frame's edges: when
+a Dolby Vision RPU's Level 5 metadata declares letterbox bars and the picture is already being
+re-encoded for that route, `DolbyVisionCrop` reads the studio's own offsets and the encode
+crops to them with `-vf crop`, `dovi_tool`'s `--crop` zeroing the RPU's own offsets as it is
+extracted. It's still not a resize in the sense this rule exists to forbid — nothing is scaled,
+and every frame lands on the RPU slot it was written for — only the dead border around the
+picture is cut, and only on the one path already producing new pixels rather than copying old
+ones. A plain re-encode, the copy path, and a Dolby Vision file that isn't being re-encoded
+never touch the frame's edges.
 
 **Verify before calling it done.** ffmpeg exiting zero does not mean the file plays —
 `Verification` asks AVFoundation the same questions the library's optimizer asks first. A

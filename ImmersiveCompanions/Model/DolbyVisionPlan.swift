@@ -59,7 +59,13 @@ struct DolbyVisionPlan {
     /// Read from the original rather than from a converted copy: a plain HEVC decoder
     /// ignores the enhancement layer, so the frames it produces are the base layer in
     /// order, which is exactly what the RPU is keyed to.
-    func extractRPUArguments(from source: URL) -> (ffmpeg: [String], doviTool: [String]) {
+    ///
+    /// - Parameter crop: Whether the picture that follows this RPU back in is being cropped
+    ///   to remove its letterbox bars. `dovi_tool`'s own `--crop` sets the Level 5 active-area
+    ///   offsets to zero as it rewrites the RPU, so the metadata stops declaring bars that the
+    ///   re-encode has already cut away — an RPU still claiming a 276-pixel border on a
+    ///   picture that no longer has one would be describing a frame that doesn't exist.
+    func extractRPUArguments(from source: URL, crop: Bool = false) -> (ffmpeg: [String], doviTool: [String]) {
         (
             ffmpeg: [
                 "-y", "-loglevel", "error",
@@ -67,7 +73,7 @@ struct DolbyVisionPlan {
                 "-map", "0:\(videoStream)", "-c:v", "copy",
                 "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-"
             ],
-            doviTool: ["-m", "\(mode)", "extract-rpu", "-", "-o"]
+            doviTool: ["-m", "\(mode)"] + (crop ? ["--crop"] : []) + ["extract-rpu", "-", "-o"]
         )
     }
 
@@ -80,18 +86,27 @@ struct DolbyVisionPlan {
     /// typically a disc remux spending 70 Mbps or more, and it is the one kind of file
     /// nothing else can convert — so what comes out here is what gets kept. Measured on
     /// exactly this material, x265 reaches at 16 Mbps what VideoToolbox needs 30 to match.
+    ///
+    /// - Parameter crop: The letterbox bars to cut away, when `DolbyVisionCrop` found the
+    ///   studio's own Level 5 geometry and this job is re-encoding the picture anyway. This is
+    ///   the one place in the app a frame is ever resized — deliberately: the frame count and
+    ///   frame rate the RPU is keyed to are untouched, only the dead border around the picture
+    ///   goes, and it goes as a real crop of real pixels rather than a conformance window or a
+    ///   `clap` box, both of which AVFoundation gets wrong on playback.
     func encodeArguments(
         from source: URL,
         to destination: URL,
         bitrate: Int,
         framesPerSecond: Double,
-        hdr: HDRMetadata
+        hdr: HDRMetadata,
+        crop: DolbyVisionCrop.Geometry? = nil
     ) -> [String] {
         [
             "-y", "-loglevel", "error",
             "-i", source.path(percentEncoded: false),
             "-map", "0:\(videoStream)", "-an", "-sn"
         ]
+        + (crop.map { ["-vf", "crop=\($0.width):\($0.height):\($0.left):\($0.top)"] } ?? [])
         + PlaybackTarget.rateControlArguments(bitrate: bitrate)
         + PlaybackTarget.encoderParameters(
             bitrate: bitrate,
@@ -149,6 +164,27 @@ struct DolbyVisionPlan {
         )
     }
 
+    /// The rate to encode the picture at, adjusted for the letterbox bars this job removes.
+    ///
+    /// `optimizedBitrate` was worked out against the frame ffprobe reports, bars included.
+    /// `PlaybackTarget` picks its rung by pixel count precisely because a barred frame and the
+    /// same picture without its bars aren't the same size — its own doc comment anticipates a
+    /// barless 3840×1600-class frame directly — so once the crop is known, the rate has to be
+    /// re-derived against the smaller, real frame rather than reused as it was measured before
+    /// the crop existed.
+    func encodeBitrate(cropped geometry: DolbyVisionCrop.Geometry?, picture: Probe.Stream?, probe: Probe) -> Int? {
+        guard let optimizedBitrate else { return nil }
+        guard let geometry else { return optimizedBitrate }
+        return PlaybackTarget.videoBitrate(
+            width: geometry.width,
+            height: geometry.height,
+            frameRate: picture?.framesPerSecond ?? 24,
+            dynamicRange: .hdr10,
+            sourceCodec: picture?.codecName ?? "hevc",
+            sourceBitrate: picture?.bitsPerSecond(durationInSeconds: probe.durationInSeconds) ?? 0
+        )
+    }
+
     /// Puts the rewritten video and the ordinary tracks into one file.
     ///
     /// `dvp=8.hdr10` is profile 8 with the HDR10 compatibility ID — 8.1, written so a
@@ -156,15 +192,14 @@ struct DolbyVisionPlan {
     /// rate has to be given because a raw stream carries no timing of its own.
     ///
     /// `tracks` is added whole rather than track by track. MP4Box's per-track `lang=`
-    /// import option would need every track in `tracks` enumerated by ID, and that file can
-    /// carry an extra one this app never asked for — ffmpeg appends a `text` track of its
-    /// own for chapters, which isn't accounted for anywhere else here — so guessing at IDs
-    /// risks silently dropping the chapters rather than fixing a language tag. Importing
-    /// the source whole avoids that, and it doesn't cost the language: MP4Box's default
-    /// import already reads each track's language straight off the source file, which is
-    /// what actually matters — `Plan.trackArguments` writes it onto the intermediate
-    /// explicitly rather than trusting it to arrive there implicitly, and this is what
-    /// then carries it the rest of the way through.
+    /// import option would need every track in `tracks` enumerated by ID, and importing the
+    /// file whole avoids that bookkeeping entirely. It doesn't cost the language: MP4Box's
+    /// default import already reads each track's language straight off the source file it's
+    /// given, which is what actually matters — `Plan.trackArguments` writes it onto the
+    /// intermediate explicitly rather than trusting it to arrive there implicitly, and this
+    /// is what then carries it the rest of the way through. `tracks` never carries a
+    /// chapter track to worry about, either: `Plan.trackArguments` drops chapters
+    /// unconditionally now, on both routes — see its doc comment for why.
     func muxArguments(video: URL, tracks: URL, to destination: URL) -> [String] {
         [
             "-quiet",

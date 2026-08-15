@@ -160,9 +160,60 @@ extension Plan {
         return (stream.disposition?["default"] ?? 0) != 0 ? "default+forced" : "forced"
     }
 
+    /// The `-disposition` value for a sidecar subtitle, mirroring `dispositionArgument`'s
+    /// combined-flag convention: `forced` and `hearing_impaired` are independent bits in
+    /// ffmpeg's own disposition mask, so a file named `Movie.eng.forced.sdh.srt` writes
+    /// both rather than picking one.
+    private static func dispositionArgument(for sidecar: SidecarSubtitle) -> String? {
+        var flags: [String] = []
+        if sidecar.isForced { flags.append("forced") }
+        if sidecar.isHearingImpaired { flags.append("hearing_impaired") }
+        return flags.isEmpty ? nil : flags.joined(separator: "+")
+    }
+
+    /// ISO 639-2 bibliographic codes, mapped to their terminological equivalents.
+    ///
+    /// Both codes name the same language — `chi` and `zho` are both "Chinese" — and either
+    /// is a legal Matroska tag, so a source can carry the bibliographic one. GPAC does not
+    /// treat the two as interchangeable: an intermediate whose subtitle track carried
+    /// `language=chi` came out of `MP4Box -add` as `language=nor` — Norwegian — reproduced
+    /// on this machine with the installed `MP4Box`, and the cause a real conversion shipped
+    /// with two Chinese subtitle tracks labelled Norwegian. `zho`, `fra`, `deu`, `nld` and
+    /// the rest of the terminological codes passed through the same import unchanged, which
+    /// is why this maps every bibliographic code to its terminological pair rather than
+    /// special-casing `chi` — the terminological code is the one every tool in this chain,
+    /// GPAC included, reads back as what it was given.
+    ///
+    /// A code not in this table — already terminological, or a language with no B/T split at
+    /// all, such as `eng` or `jpn` — passes through `normalisedLanguage` untouched.
+    private static let bibliographicToTerminological: [String: String] = [
+        "alb": "sqi", "arm": "hye", "baq": "eus", "bur": "mya", "chi": "zho",
+        "cze": "ces", "dut": "nld", "fre": "fra", "geo": "kat", "ger": "deu",
+        "gre": "ell", "ice": "isl", "mac": "mkd", "mao": "mri", "may": "msa",
+        "per": "fas", "rum": "ron", "slo": "slk", "tib": "bod", "wel": "cym"
+    ]
+
+    /// The language tag actually worth writing: a bibliographic ISO 639-2 code rewritten to
+    /// its terminological pair, or the code unchanged when it isn't one. Every site in this
+    /// file that writes a `language=` metadata argument — audio, source subtitles, sidecar
+    /// subtitles — goes through this rather than writing `stream.language` or
+    /// `sidecar.language` straight through, so the fix in `bibliographicToTerminological`'s
+    /// doc comment reaches all three the same way.
+    private static func normalisedLanguage(_ language: String) -> String {
+        bibliographicToTerminological[language] ?? language
+    }
+
     /// How the audio and subtitles are handled, which is the same either route.
+    ///
+    /// - Parameter sidecars: Subtitle files found beside the source — see
+    ///   `SidecarSubtitle.discover` — already validated against the probe's duration by the
+    ///   caller. Each is its own ffmpeg input by the time this runs: `Plan.init` and
+    ///   `trackOnlyArguments` both add a `-i` for every sidecar right after the source's
+    ///   own, in this same order, so a sidecar at `sidecars[offset]` is always ffmpeg input
+    ///   `offset + 1` — input `0` being the source throughout this app.
     static func trackArguments(
-        for probe: Probe
+        for probe: Probe,
+        sidecars: [SidecarSubtitle] = []
     ) -> (arguments: [String], notes: [String], isReencoding: Bool) {
         var arguments: [String] = []
         var notes: [String] = []
@@ -186,13 +237,13 @@ extension Plan {
             // source file it's given, so as long as the intermediate has the right tag on
             // it, so does the file built from it.
             if let language = track.stream.language {
-                arguments += ["-metadata:s:a:\(offset)", "language=\(language)"]
+                arguments += ["-metadata:s:a:\(offset)", "language=\(Plan.normalisedLanguage(language))"]
             }
         }
         notes += audio.notes
         reencoding = reencoding || audio.tracks.contains { !$0.isCopy }
 
-        // Subtitles: only the ones MP4 can hold.
+        // Subtitles: only the ones MP4 can hold, source tracks first.
         let text = probe.subtitleStreams.filter { textSubtitles.contains($0.codecName ?? "") }
         for (offset, stream) in text.enumerated() {
             arguments += ["-map", "0:\(stream.index)"]
@@ -200,10 +251,26 @@ extension Plan {
                 arguments += ["-disposition:s:\(offset)", disposition]
             }
             if let language = stream.language {
-                arguments += ["-metadata:s:s:\(offset)", "language=\(language)"]
+                arguments += ["-metadata:s:s:\(offset)", "language=\(Plan.normalisedLanguage(language))"]
             }
         }
-        arguments += text.isEmpty ? ["-sn"] : ["-c:s", "mov_text"]
+
+        // Sidecar files next, numbered onward from the source's own text tracks: ffmpeg
+        // assigns a `-map`ped subtitle stream its output index by the order it's mapped in,
+        // not by which input it came from, so a sidecar takes `text.count + offset` here
+        // regardless of how far into the file its own input sits.
+        for (offset, sidecar) in sidecars.enumerated() {
+            let outputIndex = text.count + offset
+            arguments += ["-map", "\(offset + 1):0"]
+            if let disposition = Plan.dispositionArgument(for: sidecar) {
+                arguments += ["-disposition:s:\(outputIndex)", disposition]
+            }
+            if let language = sidecar.language {
+                arguments += ["-metadata:s:s:\(outputIndex)", "language=\(Plan.normalisedLanguage(language))"]
+            }
+        }
+
+        arguments += (text.isEmpty && sidecars.isEmpty) ? ["-sn"] : ["-c:s", "mov_text"]
 
         // Everything not carried across as text: PGS and VobSub, which have no home in
         // MP4, and the odd text codec ffmpeg can't remux into `mov_text`. A forced one
@@ -221,41 +288,64 @@ extension Plan {
             notes.append("\(droppedOther) image subtitle\(droppedOther == 1 ? "" : "s") dropped")
         }
 
-        // Chapters are carried across by default, which is right until they are wrong.
-        // A set running past the end of the file becomes a `text` track longer than the
-        // media, and AVFoundation takes an asset's duration from its longest track — so the
-        // library would read the runtime off that and show it. Better no chapters than a
-        // file that lies about how long it is.
-        if probe.hasChaptersPastTheEnd {
-            arguments += ["-map_chapters", "-1"]
-            notes.append("chapters dropped — they ran past the end of the file")
+        if !sidecars.isEmpty {
+            notes.append(sidecars.count == 1
+                ? "1 subtitle added from a file beside the movie"
+                : "\(sidecars.count) subtitles added from files beside the movie")
         }
+
+        // Chapters are dropped unconditionally, on both routes. Apple's own store encodes
+        // don't carry them, and this app exists to produce files that pass for one of those
+        // — so parity with what Apple ships is the rule, not merely a fallback for the one
+        // case that used to be visibly broken. It also removes a GPAC defect as a side
+        // effect: ffmpeg writes a chapter as a timed-text track of its own (`SubtitleHandler`,
+        // `tref 'chap'`) alongside the real chapter atom, and on the Dolby Vision route,
+        // once the intermediate MP4Box imports whole also carries `mov_text` subtitle
+        // tracks — as it does whenever the source has embedded text subtitles or a sidecar
+        // file — that timed-text track comes out the other side as a `bin_data` track
+        // running the length of the film: a phantom stream in the output, confirmed on the
+        // installed `MP4Box`. `-map_chapters -1` here removes the cause on both routes at
+        // once, rather than the symptom on the one route where it happened to surface.
+        arguments += ["-map_chapters", "-1"]
 
         return (arguments, notes, reencoding)
     }
 
     /// The audio and subtitles alone, for the file GPAC adds to the rebuilt video.
-    static func trackOnlyArguments(for probe: Probe, from source: URL, to destination: URL) -> [String] {
+    ///
+    /// - Parameter sidecars: See `trackArguments` — added here as their own `-i` inputs,
+    ///   right after the source, in the same order `trackArguments` numbers them in.
+    static func trackOnlyArguments(
+        for probe: Probe, from source: URL, to destination: URL, sidecars: [SidecarSubtitle] = []
+    ) -> [String] {
         ["-y", "-loglevel", "error", "-i", source.path(percentEncoded: false)]
-            + ["-vn"] + trackArguments(for: probe).arguments
+            + sidecars.flatMap { ["-i", $0.url.path(percentEncoded: false)] }
+            + ["-vn"] + trackArguments(for: probe, sidecars: sidecars).arguments
             + ["-progress", "pipe:1", "-nostats", destination.path(percentEncoded: false)]
     }
 
-    /// - Parameter isRebuildingDolbyVision: Whether the Dolby Vision route is handling the
-    ///   picture, in which case this plan describes only the audio and subtitles and must
-    ///   not also report what would have happened to the Dolby Vision without it.
+    /// - Parameters:
+    ///   - isRebuildingDolbyVision: Whether the Dolby Vision route is handling the picture,
+    ///     in which case this plan describes only the audio and subtitles and must not also
+    ///     report what would have happened to the Dolby Vision without it.
+    ///   - sidecars: Subtitle files found beside the source and already checked against the
+    ///     probe's duration — see `SidecarSubtitle`. Added as their own `-i` inputs right
+    ///     after the source, which is what lets `trackArguments` address them by a fixed
+    ///     `offset + 1`.
     init(
         for probe: Probe,
         from source: URL,
         to destination: URL,
         isRebuildingDolbyVision: Bool = false,
-        hdr: HDRMetadata = HDRMetadata(framesJSON: Data())
+        hdr: HDRMetadata = HDRMetadata(framesJSON: Data()),
+        sidecars: [SidecarSubtitle] = []
     ) throws {
         guard let picture = probe.picture, let codec = picture.codecName else {
             throw ConversionError.noVideo
         }
 
         var arguments = ["-y", "-i", source.path(percentEncoded: false)]
+            + sidecars.flatMap { ["-i", $0.url.path(percentEncoded: false)] }
         var notes: [String] = []
         var reencoding = false
 
@@ -279,7 +369,7 @@ extension Plan {
             arguments += Plan.videoEncodeArguments(for: picture, probe: probe, hdr: hdr)
         }
 
-        let tracks = Plan.trackArguments(for: probe)
+        let tracks = Plan.trackArguments(for: probe, sidecars: sidecars)
         arguments += tracks.arguments
         notes += tracks.notes
         reencoding = reencoding || tracks.isReencoding

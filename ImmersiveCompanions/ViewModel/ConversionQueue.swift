@@ -237,6 +237,22 @@ final class ConversionQueue {
         )
     }
 
+    /// Whether this file's letterbox bars are worth removing, and by how much.
+    ///
+    /// Only asked when the picture is already being re-encoded for Dolby Vision. Cropping
+    /// needs a real re-encode — the lossless ways to shrink the frame, an SPS conformance
+    /// window or MP4 clean aperture, both play back wrong through AVPlayer — so this is asked
+    /// on the one route that already produces new pixels rather than copying old ones. See
+    /// `DolbyVisionCrop`.
+    private static func dolbyVisionCropGeometry(
+        for dolbyVision: DolbyVisionPlan?,
+        source: URL,
+        probe: Probe
+    ) async -> DolbyVisionCrop.Geometry? {
+        guard let dolbyVision, dolbyVision.optimizedBitrate != nil else { return nil }
+        return await DolbyVisionCrop.geometry(for: source, probe: probe, videoStream: dolbyVision.videoStream)
+    }
+
     /// Runs the three steps a Dolby Vision rebuild takes.
     ///
     /// The weights are how long each actually takes rather than an even split: the demux
@@ -246,6 +262,8 @@ final class ConversionQueue {
         _ plan: DolbyVisionPlan,
         probe: Probe,
         hdr: HDRMetadata,
+        crop: DolbyVisionCrop.Geometry?,
+        sidecars: [SidecarSubtitle],
         from source: URL,
         to destination: URL,
         onProgress: @escaping @MainActor (Double) -> Void
@@ -263,14 +281,14 @@ final class ConversionQueue {
         let tracksURL = scratch.appending(path: "tracks.mp4")
         let sourceBytes = source.currentFileSize
 
-        if let bitrate = plan.optimizedBitrate {
+        if let bitrate = plan.encodeBitrate(cropped: crop, picture: probe.picture, probe: probe) {
             // The RPU comes out first, the picture is re-encoded without it, and it goes
             // back in afterwards. Every frame is still where it was, so every RPU still
             // lands on the frame it describes.
             let rpuURL = scratch.appending(path: "rpu.bin")
             let encodedURL = scratch.appending(path: "encoded.hevc")
 
-            let extraction = plan.extractRPUArguments(from: source)
+            let extraction = plan.extractRPUArguments(from: source, crop: crop != nil)
             try await Process.runPiped(
                 ffmpeg, arguments: extraction.ffmpeg,
                 into: doviTool, arguments: extraction.doviTool + [rpuURL.path(percentEncoded: false)],
@@ -285,7 +303,8 @@ final class ConversionQueue {
                     from: source, to: encodedURL,
                     bitrate: bitrate,
                     framesPerSecond: probe.picture?.framesPerSecond ?? 24,
-                    hdr: hdr
+                    hdr: hdr,
+                    crop: crop
                 ),
                 duration: probe.durationInSeconds,
                 holding: { self.current = $0 }
@@ -312,7 +331,7 @@ final class ConversionQueue {
         // The audio and subtitles, the ordinary way.
         try await Process.run(
             ffmpeg,
-            arguments: Plan.trackOnlyArguments(for: probe, from: source, to: tracksURL),
+            arguments: Plan.trackOnlyArguments(for: probe, from: source, to: tracksURL, sidecars: sidecars),
             duration: probe.durationInSeconds,
             holding: { self.current = $0 }
         ) { onProgress(0.80 + $0 * 0.05) }
@@ -371,27 +390,51 @@ final class ConversionQueue {
             // and content light level on the frames rather than the stream. x265 drops both
             // unless handed them, and the specification asks for them (1.35).
             let hdr = await Self.readHDRMetadata(from: source, probe: probe)
+            // Only asked when the picture above is already being re-encoded — see
+            // `dolbyVisionCropGeometry`.
+            let cropGeometry = await Self.dolbyVisionCropGeometry(for: dolbyVision, source: source, probe: probe)
+
+            // Subtitle files sitting beside the source — PGS's major-language replacement.
+            // Each is checked against the probe's own duration before it's trusted with
+            // anything; one that fails the check is left out of `sidecars` entirely and its
+            // reason folded into the row's summary below, rather than muxed in on faith.
+            var sidecarSkipNotes: [String] = []
+            let sidecars = SidecarSubtitle.discover(for: source).filter { sidecar in
+                if let reason = sidecar.skipReason(durationInSeconds: probe.durationInSeconds) {
+                    sidecarSkipNotes.append(reason)
+                    return false
+                }
+                return true
+            }
+
             let plan = try Plan(
                 for: probe,
                 from: source,
                 to: destination,
                 isRebuildingDolbyVision: dolbyVision != nil,
-                hdr: hdr
+                hdr: hdr,
+                sidecars: sidecars
             )
 
             // The output is about the size of the input — the video is usually copied
             // whole. Better to say so now than to fill the disk and fail at the far end of
             // an hour's work.
             try checkSpace(for: source, writingTo: destination)
-            let summary = switch (dolbyVision, dolbyVision?.optimizedBitrate) {
+            let reencodedBitrate = dolbyVision?.encodeBitrate(cropped: cropGeometry, picture: probe.picture, probe: probe)
+            let outcomeSummary = switch (dolbyVision, reencodedBitrate) {
             case (nil, _):
                 plan.summary
             case (_, let bitrate?):
                 "Dolby Vision 8.1 kept, picture re-encoded at "
-                    + "\(Int((Double(bitrate) / 1_000_000).rounded())) Mbps, " + plan.summary
+                    + "\(Int((Double(bitrate) / 1_000_000).rounded())) Mbps"
+                    + (cropGeometry.map { ", letterbox removed — \($0.width)×\($0.height)" } ?? "")
+                    + ", " + plan.summary
             default:
                 "Dolby Vision → profile 8.1, " + plan.summary
             }
+            let summary = sidecarSkipNotes.isEmpty
+                ? outcomeSummary
+                : ([outcomeSummary] + sidecarSkipNotes).joined(separator: ", ")
             update(id) { job in
                 job.summary = summary
                 job.details = probe.mediaSummary
@@ -417,6 +460,8 @@ final class ConversionQueue {
                     dolbyVision,
                     probe: probe,
                     hdr: hdr,
+                    crop: cropGeometry,
+                    sidecars: sidecars,
                     from: source,
                     to: destination,
                     onProgress: report
@@ -431,7 +476,11 @@ final class ConversionQueue {
                 )
             }
 
-            try await Verification.check(destination, wasRebuiltAsDolbyVision: dolbyVision != nil)
+            try await Verification.check(
+                destination,
+                wasRebuiltAsDolbyVision: dolbyVision != nil,
+                expectedCroppedSize: cropGeometry.map { (width: $0.width, height: $0.height) }
+            )
 
             update(id) { job in
                 job.output = destination

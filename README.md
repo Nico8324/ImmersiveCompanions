@@ -6,8 +6,8 @@
 ![License](https://img.shields.io/badge/license-proprietary-red)
 
 The Mac companion to [Immersive Cinema](https://github.com/Nico8324/Immersive-Cinema). It
-rewraps video into MP4 the library can open — keeping Dolby Vision, HDR, chapters, every
-audio track and every subtitle MP4 will carry.
+rewraps video into MP4 the library can open — keeping Dolby Vision, HDR, one audio track
+per language and every subtitle MP4 will carry, shaped the way Apple ships its own.
 
 <p align="center">
   <img src="Docs/window.png" alt="Immersive Companions’ window, showing its drop target" width="680">
@@ -68,9 +68,19 @@ A typical MKV is H.264 or HEVC with AAC or AC-3, so the usual result is a **stre
 a couple of seconds, byte-for-byte identical picture, no quality lost. The row tells you
 which you got — "Rewrapped, nothing re-encoded" or what was converted and why.
 
-Also carried across: **chapters**, HDR colour tags, mastering-display and content-light
-metadata, and per-track languages. Cover-art "video" streams are skipped, so a poster
-doesn't become the film.
+Also carried across: HDR colour tags, mastering-display and content-light metadata, and
+per-track languages. Cover-art "video" streams are skipped, so a poster doesn't become the
+film. **Chapters are dropped, on every route, on purpose** — Apple's own store encodes don't
+carry them, so matching what Apple ships is the rule here, not a limitation to work around.
+
+**Letterbox bars are cropped away, but only when Dolby Vision's own metadata says where they
+are and the picture is already being re-encoded.** Apple's own store encodes carry no bars —
+the frame *is* the active picture — and a Dolby Vision RPU's Level 5 metadata already
+declares exactly where a studio put its own, so there's no bar-detection heuristic here, only
+a read of what the source already says. A file without that metadata, or without a re-encode
+happening anyway, keeps its bars: cropping needs a real pixel move, and the lossless
+shortcuts — an SPS conformance window, MP4 clean aperture — both play back wrong through
+AVPlayer. See [Dolby Vision](#dolby-vision) below.
 
 ### Audio: one main track per language
 
@@ -94,7 +104,46 @@ dropped".
 
 Every surviving track keeps the language tag it came in with, written explicitly rather
 than left to travel through ffmpeg and, on the Dolby Vision route, GPAC implicitly — a file
-was once observed coming out the far end with `und` on every track.
+was once observed coming out the far end with `und` on every track. ISO 639-2 *bibliographic*
+codes (`chi`, `fre`, `ger`, and seventeen others) are rewritten to their *terminological*
+pair (`zho`, `fra`, `deu`, …) on the way — GPAC's own import corrupts `chi` into `nor`
+(Norwegian) on the Dolby Vision route, reproduced on the installed `MP4Box`, and every other
+code in the pair passed the same import through untouched.
+
+### Subtitles from a file beside the movie
+
+A Blu-ray rip's major-language subtitles are usually PGS images, which have nowhere to go
+in MP4 and get dropped — the row above. The remedy is supplying the text yourself: a plain
+subtitle file named after the source, sitting in the same folder, is folded into the output
+as a native `mov_text` track. It ends up **inside** the MP4, so the sidecar file can be
+deleted once the conversion is done — this is the user-supplied equivalent of the text
+files studios themselves hand Apple's own pipeline as iTT, and it's exactly the case PGS
+subtitles exist for here.
+
+Accepted extensions: `.srt`, `.ass`, `.ssa`, `.vtt`. The name has to start with the source's
+own stem plus a dot — `Movie2.srt` is never mistaken for `Movie.mkv`'s subtitles — and can
+carry dotted components in any order:
+
+```
+Movie.srt              no language tag written
+Movie.eng.srt          language: eng
+Movie.en.forced.srt    language: en, forced (auto-displays for foreign dialogue on Apple players)
+Movie.fre.sdh.srt      language: fra, hearing-impaired
+```
+
+A 2- or 3-letter component is taken as an ISO 639 language tag and passed straight through —
+there's no mapping table of our own beyond the ISO 639-2 bibliographic-to-terminological
+normalisation every language tag in this app goes through (see above), so `Movie.fre.srt`
+is written as `fra`. Otherwise whatever ffmpeg and MP4 accept is what gets written. `forced`
+and `sdh` set their dispositions, and a file can carry both. An unrecognised component is
+ignored rather than disqualifying the file.
+
+Each file is checked before it's trusted with anything: unreadable or empty files are
+skipped, and one whose last cue runs more than about ten minutes past the probed duration is
+treated as belonging to a different cut of the film and skipped too — either way, the row's
+summary says so rather than muxing in subtitles that quietly lie about where the film ends.
+**The file has to be UTF-8** — ffmpeg expects it, and no charset conversion is attempted, so
+a file in another encoding fails to mux the same way it fails to read here.
 
 ### When it does re-encode
 
@@ -144,7 +193,11 @@ Three steps, because no single tool does all of it. ffmpeg demuxes but can't rew
 RPU; `dovi_tool` rewrites the RPU but doesn't mux; and ffmpeg's MP4 muxer **cannot write
 the `dvvC` box** that marks a track as Dolby Vision — only GPAC will. So the video goes out
 to a raw stream, through `dovi_tool`, and back in through `MP4Box`, while audio and
-subtitles take the ordinary route and are added at the end.
+subtitles take the ordinary route and are added at the end. This route is also why
+chapters are dropped everywhere, not just here: MP4Box's whole-file import of the
+audio-and-subtitles intermediate used to turn ffmpeg's own chapter track into a phantom
+`bin_data` stream once that intermediate also carried subtitle tracks, and excluding
+chapters unconditionally removed that alongside matching what Apple's own encodes do.
 
 It's written as `dvp=8.hdr10` — profile 8 with the HDR10 compatibility ID — so a player
 that knows Dolby Vision gets Dolby Vision, and one that doesn't still sees correct HDR10.
@@ -176,6 +229,34 @@ describes.
 Off by default. Converting is the job; re-encoding costs a generation of quality and real
 time, and should be asked for. It applies only to Dolby Vision, because that's the only case
 the library can't handle for itself.
+
+**Letterbox bars come off on this route too, when Dolby Vision says where they are.** A
+Dolby Vision RPU can carry Level 5 active-area metadata — the studio's own declaration of
+where the bars sit, not a guess this app makes. Before the re-encode, three short samples
+near the start, middle and end of the source are read back through `dovi_tool` and compared;
+only when all three agree exactly, the offsets survive 4:2:0 subsampling, and what's left is
+still a real picture does the crop go ahead. A film whose framing genuinely changes partway
+through — an IMAX sequence opening into open matte — disagrees between samples and correctly
+keeps its bars rather than being cropped to whichever one was read first.
+
+```
+3840×2160  →  crop=3840:1608:0:276        letterbox removed, Dolby Vision: profile 8.1
+```
+
+The bit rate is chosen for the cropped frame, not the padded one — `PlaybackTarget` already
+picks its rung by pixel count for exactly this reason, a 2.39:1 feature without its bars
+being three-quarters of a 4K frame rather than a full one. `dovi_tool`'s own `--crop` flag
+zeroes the RPU's Level 5 offsets on the way through, so the metadata stops declaring bars
+that the picture no longer has.
+
+This is the one place the app ever resizes a frame, and it's still true that it never
+resamples one: frame count and frame rate are untouched, which is what keeps every RPU
+landing on the frame it was written for. Only the dead border goes, and only as a real crop
+of real pixels — not the SPS conformance window or MP4 clean aperture that would be simpler
+to write but don't play back correctly through AVPlayer.
+
+A crop only ever happens alongside a re-encode: the plain rewrap route, and any file without
+Dolby Vision Level 5 metadata, keep their bars.
 
 ## It checks its own work
 
@@ -267,7 +348,15 @@ the app knows to leave Dolby Vision alone.
   object-based mix, not the surround channels under it.
 - **PGS and VobSub subtitles are dropped.** MP4 has nowhere to put them. A dropped *forced*
   track gets its own warning, since losing one changes what the film contains rather than
-  merely trims a spare — but check before relying on it regardless.
+  merely trims a spare — but check before relying on it regardless. A file named after the
+  source and sitting beside it can supply the text yourself; see
+  [Subtitles from a file beside the movie](#subtitles-from-a-file-beside-the-movie).
+- **Sidecar subtitle files must be UTF-8.** No charset conversion is attempted — ffmpeg
+  expects UTF-8, and a file in another encoding fails to mux the same way it fails to read
+  here. Discovery and the duration sanity check are verified against synthetic SRT files;
+  ASS/SSA and VTT parse the same shapes on paper but haven't been run against real files
+  from either format, and the whole feature hasn't yet been run against a real Blu-ray
+  remux's own subtitle files.
 - **Variable frame rate** isn't handled on the Dolby Vision route: a raw stream carries no
   timing, so GPAC is given one rate. Films are constant rate; camera footage may not be.
 - **HDR stills are converted, not tone mapped.** A frame from a PQ or HLG file is labelled
@@ -282,7 +371,10 @@ the app knows to leave Dolby Vision alone.
   Mbps against a source asking 1.8 — but only on synthetic footage, and only in SDR.
   The one-track-per-language audio selection and the Dolby Vision RPU spot check are new
   and verified against synthetic multi-track files built for the purpose, not yet against a
-  real multi-language, multi-commentary disc remux.
+  real multi-language, multi-commentary disc remux. **Letterbox cropping is also new and
+  unverified against a real Dolby Vision file** — the Level 5 JSON shape it parses was
+  confirmed against `dovi_tool`'s own bundled test RPU, and the crop and bit-rate logic
+  against the code, but not yet run start to finish against a real disc remux with bars.
 
 ## Licence
 

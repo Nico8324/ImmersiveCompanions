@@ -17,14 +17,24 @@ import Foundation
 /// `AVAssetReader` is constructed too, because that's the first thing Immersive Cinema's
 /// optimizer does, and a file it can't read is a file that can't be optimized.
 enum Verification {
-    /// - Parameter wasRebuiltAsDolbyVision: Whether this file went through
-    ///   `ConversionQueue.runDolbyVision` — RPU extracted, base layer rebuilt or converted,
-    ///   RPU injected, muxed by MP4Box. Passed in by the caller, which knows which route
-    ///   ran, rather than guessed from the file: a plain HDR10 file and a Dolby Vision file
-    ///   that lost its RPU partway through the rebuild look identical to AVFoundation, so
-    ///   asking the file itself "is this Dolby Vision" isn't a question this check could
-    ///   answer honestly.
-    static func check(_ url: URL, wasRebuiltAsDolbyVision: Bool) async throws {
+    /// - Parameters:
+    ///   - wasRebuiltAsDolbyVision: Whether this file went through
+    ///     `ConversionQueue.runDolbyVision` — RPU extracted, base layer rebuilt or converted,
+    ///     RPU injected, muxed by MP4Box. Passed in by the caller, which knows which route
+    ///     ran, rather than guessed from the file: a plain HDR10 file and a Dolby Vision file
+    ///     that lost its RPU partway through the rebuild look identical to AVFoundation, so
+    ///     asking the file itself "is this Dolby Vision" isn't a question this check could
+    ///     answer honestly.
+    ///   - expectedCroppedSize: The picture size `DolbyVisionCrop` and the encode were told to
+    ///     produce, when this job removed letterbox bars. `nil` for everything else — a copy,
+    ///     a plain re-encode, or a Dolby Vision file whose bars were kept. Passed in for the
+    ///     same reason as `wasRebuiltAsDolbyVision`: this check can confirm a size, not decide
+    ///     on its own what size was ever asked for.
+    static func check(
+        _ url: URL,
+        wasRebuiltAsDolbyVision: Bool,
+        expectedCroppedSize: (width: Int, height: Int)? = nil
+    ) async throws {
         let asset = AVURLAsset(url: url)
         let (playable, duration) = try await asset.load(.isPlayable, .duration)
         let video = try await asset.loadTracks(withMediaType: .video)
@@ -38,6 +48,35 @@ enum Verification {
 
         if wasRebuiltAsDolbyVision {
             try await checkDolbyVisionRPU(url, durationInSeconds: duration.seconds)
+        }
+
+        if let expectedCroppedSize {
+            try await checkCroppedSize(video, expected: expectedCroppedSize)
+        }
+    }
+
+    /// Confirms the letterbox bars this job asked ffmpeg to crop actually left the file,
+    /// rather than trusting that a `-vf crop` argument ffmpeg accepted was one it obeyed.
+    ///
+    /// Checked against `naturalSize` rather than the coded picture size on purpose: HEVC's
+    /// internal, CTU-padded picture can be larger than what a player actually shows, and
+    /// `naturalSize` is already the cropped, displayed frame — the figure the library itself
+    /// would draw. Width is checked exactly; height is allowed a couple of pixels of slack for
+    /// the same reason, in case an encoder's reported display size rounds differently from the
+    /// coded height than it does for width. Not yet exercised against a real cropped encode —
+    /// worth confirming this tolerance is neither too strict nor hiding a real mismatch the
+    /// first time this runs against real Dolby Vision media.
+    private static func checkCroppedSize(_ video: [AVAssetTrack], expected: (width: Int, height: Int)) async throws {
+        guard let track = video.first else { throw ConversionError.unplayableResult }
+        let size = try await track.load(.naturalSize)
+        let actualWidth = Int(size.width.rounded())
+        let actualHeight = Int(size.height.rounded())
+
+        guard actualWidth == expected.width, abs(actualHeight - expected.height) <= 2 else {
+            throw ConversionError.letterboxCropLost(
+                expectedWidth: expected.width, expectedHeight: expected.height,
+                actualWidth: actualWidth, actualHeight: actualHeight
+            )
         }
     }
 

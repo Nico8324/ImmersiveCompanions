@@ -13,6 +13,7 @@ enum ConversionError: LocalizedError {
     case notEnoughSpace(needed: Int64, free: Int64)
     case unplayableResult
     case dolbyVisionLost
+    case letterboxCropLost(expectedWidth: Int, expectedHeight: Int, actualWidth: Int, actualHeight: Int)
     case failed(String)
 
     var errorDescription: String? {
@@ -29,6 +30,10 @@ enum ConversionError: LocalizedError {
         case .dolbyVisionLost:
             return "The Dolby Vision RPU didn’t survive the rebuild, so the file was deleted rather than kept " +
                 "looking like Dolby Vision when it no longer is."
+        case .letterboxCropLost(let expectedWidth, let expectedHeight, let actualWidth, let actualHeight):
+            return "The letterbox crop didn’t survive the rebuild — expected " +
+                "\(expectedWidth)×\(expectedHeight) but the file plays back at " +
+                "\(actualWidth)×\(actualHeight), so it was deleted rather than kept looking cropped when it isn’t."
         case .failed(let message):
             return message.isEmpty ? "The conversion failed." : message
         }
